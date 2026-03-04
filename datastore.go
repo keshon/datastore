@@ -1,172 +1,235 @@
 package datastore
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 )
 
+// ErrClosed is returned when operations are attempted on a closed DataStore.
+var ErrClosed = errors.New("datastore: store is closed")
+
+// Option is a functional option for configuring a DataStore.
+type Option func(*DataStore)
+
+// WithSaveInterval sets the interval for periodic saves (default: 5 minutes).
+func WithSaveInterval(d time.Duration) Option {
+	return func(ds *DataStore) {
+		ds.saveInterval = d
+	}
+}
+
+// WithLogger sets a custom slog.Logger (default: slog.Default()).
+func WithLogger(l *slog.Logger) Option {
+	return func(ds *DataStore) {
+		ds.log = l
+	}
+}
+
+// DataStore is a thread-safe, persistent key-value store backed by a JSON file.
+// It periodically flushes to disk and supports graceful shutdown via context.
+//
+// Values are stored as json.RawMessage internally to avoid lossy round-trips
+// (e.g. numbers becoming float64 after unmarshal).
 type DataStore struct {
-	data   map[string]any // in-memory data storage
-	file   string         // file path for persistent storage
-	mu     sync.RWMutex   // mutex for thread-safe access
-	ticker *time.Ticker   // ticker for periodic saving
-	done   chan struct{}  // shutdown signal channel, buffered
-	wg     sync.WaitGroup // wait group for goroutines
-	once   sync.Once      // ensure done channel closes only once
+	data         map[string]json.RawMessage
+	file         string
+	saveInterval time.Duration
+	log          *slog.Logger
+
+	mu     sync.RWMutex
+	once   sync.Once
+	closed bool
+	wg     sync.WaitGroup
 }
 
-func New(filePath string) (*DataStore, error) {
-	store := &DataStore{
-		data:   make(map[string]interface{}),
-		file:   filePath,
-		ticker: time.NewTicker(5 * time.Minute), // safer save interval
-		done:   make(chan struct{}, 1),          // buffered to avoid blocking
+// New creates a new DataStore backed by filePath.
+// The provided context controls the lifecycle of the background save goroutine:
+// when ctx is cancelled, the goroutine stops and a final save is performed.
+func New(ctx context.Context, filePath string, opts ...Option) (*DataStore, error) {
+	ds := &DataStore{
+		data:         make(map[string]json.RawMessage),
+		file:         filePath,
+		saveInterval: 5 * time.Minute,
+		log:          slog.Default(),
+	}
+	for _, o := range opts {
+		o(ds)
 	}
 
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		if err := os.WriteFile(filePath, []byte("{}"), 0644); err != nil {
-			return nil, fmt.Errorf("failed to create empty JSON file: %v", err)
-		}
-	} else if err == nil {
-		if err := store.loadFromFile(); err != nil {
-			return nil, fmt.Errorf("failed to load data from file: %v", err)
-		}
-	} else {
-		return nil, fmt.Errorf("failed to check file existence: %v", err)
+	if err := ds.initFile(); err != nil {
+		return nil, err
 	}
 
-	store.wg.Add(1)
-	go store.autoSave()
+	ds.wg.Add(1)
+	go ds.autoSave(ctx)
 
-	store.handleShutdown()
-
-	return store, nil
+	return ds, nil
 }
 
-func (ds *DataStore) Add(key string, value interface{}) {
+// Set stores value under key. value must be JSON-serialisable.
+func (ds *DataStore) Set(key string, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("datastore: marshal value for key %q: %w", key, err)
+	}
+
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	ds.data[key] = value
+
+	if ds.closed {
+		return ErrClosed
+	}
+	ds.data[key] = raw
+	return nil
 }
 
-func (ds *DataStore) Get(key string) (interface{}, bool) {
+// Get retrieves the value for key and unmarshals it into dest.
+// Returns (false, nil) if the key does not exist.
+func (ds *DataStore) Get(key string, dest any) (bool, error) {
 	ds.mu.RLock()
-	defer ds.mu.RUnlock()
-	value, exists := ds.data[key]
-	return value, exists
+	raw, exists := ds.data[key]
+	ds.mu.RUnlock()
+
+	if !exists {
+		return false, nil
+	}
+	if err := json.Unmarshal(raw, dest); err != nil {
+		return true, fmt.Errorf("datastore: unmarshal value for key %q: %w", key, err)
+	}
+	return true, nil
 }
 
-func (ds *DataStore) GetAll() map[string]any {
-	ds.mu.RLock()
-	defer ds.mu.RUnlock()
-	return ds.data
-}
-
-func (ds *DataStore) Delete(key string) {
+// Delete removes key from the store. No-op if key does not exist.
+func (ds *DataStore) Delete(key string) error {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+
+	if ds.closed {
+		return ErrClosed
+	}
 	delete(ds.data, key)
+	return nil
 }
 
+// Keys returns a snapshot of all current keys.
 func (ds *DataStore) Keys() []string {
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
+
 	keys := make([]string, 0, len(ds.data))
-	for key := range ds.data {
-		keys = append(keys, key)
+	for k := range ds.data {
+		keys = append(keys, k)
 	}
 	return keys
 }
 
-func (ds *DataStore) saveToFile() error {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
+// Len returns the number of keys in the store.
+func (ds *DataStore) Len() int {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	return len(ds.data)
+}
 
-	data, err := json.MarshalIndent(ds.data, "", "  ")
+// Close performs a final save and marks the store as closed.
+// Subsequent writes will return ErrClosed. Safe to call multiple times.
+func (ds *DataStore) Close() error {
+	var saveErr error
+	ds.once.Do(func() {
+		ds.mu.Lock()
+		ds.closed = true
+		ds.mu.Unlock()
+
+		ds.wg.Wait() // wait for autoSave to exit
+
+		if err := ds.saveToFile(); err != nil {
+			saveErr = err
+		}
+		ds.log.Info("datastore closed", "file", ds.file)
+	})
+	return saveErr
+}
+
+// --- internal ---
+
+func (ds *DataStore) initFile() error {
+	_, err := os.Stat(ds.file)
+	if os.IsNotExist(err) {
+		if err := os.WriteFile(ds.file, []byte("{}"), 0o644); err != nil {
+			return fmt.Errorf("datastore: create file %q: %w", ds.file, err)
+		}
+		return nil
+	}
 	if err != nil {
-		return fmt.Errorf("failed to marshal data: %v", err)
+		return fmt.Errorf("datastore: stat file %q: %w", ds.file, err)
 	}
-
-	// Write atomically to avoid corruption
-	tmpFile := ds.file + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write temp file: %v", err)
-	}
-	if err := os.Rename(tmpFile, ds.file); err != nil {
-		return fmt.Errorf("failed to rename temp file: %v", err)
-	}
-
-	return nil
+	return ds.loadFromFile()
 }
 
 func (ds *DataStore) loadFromFile() error {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-
-	data, err := os.ReadFile(ds.file)
+	raw, err := os.ReadFile(ds.file)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %v", err)
+		return fmt.Errorf("datastore: read file %q: %w", ds.file, err)
 	}
 
-	if err := json.Unmarshal(data, &ds.data); err != nil {
-		return fmt.Errorf("failed to unmarshal data: %v", err)
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return fmt.Errorf("datastore: parse file %q: %w", ds.file, err)
+	}
+
+	ds.mu.Lock()
+	ds.data = data
+	ds.mu.Unlock()
+	return nil
+}
+
+// saveToFile serialises the current snapshot and writes it atomically.
+func (ds *DataStore) saveToFile() error {
+	ds.mu.RLock()
+	snapshot := make(map[string]json.RawMessage, len(ds.data))
+	for k, v := range ds.data {
+		snapshot[k] = v
+	}
+	ds.mu.RUnlock()
+
+	raw, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("datastore: marshal: %w", err)
+	}
+
+	tmp := ds.file + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return fmt.Errorf("datastore: write temp file: %w", err)
+	}
+	if err := os.Rename(tmp, ds.file); err != nil {
+		_ = os.Remove(tmp) // best-effort cleanup
+		return fmt.Errorf("datastore: rename temp file: %w", err)
 	}
 	return nil
 }
 
-func (ds *DataStore) autoSave() {
+func (ds *DataStore) autoSave(ctx context.Context) {
 	defer ds.wg.Done()
+
+	ticker := time.NewTicker(ds.saveInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ds.done:
+		case <-ctx.Done():
+			ds.log.Info("datastore autosave stopping", "reason", ctx.Err())
 			return
-		case <-ds.ticker.C:
+		case <-ticker.C:
 			if err := ds.saveToFile(); err != nil {
-				log.Printf("Auto-save error: %v", err)
+				ds.log.Error("datastore autosave failed", "err", err)
+			} else {
+				ds.log.Debug("datastore autosaved", "file", ds.file, "keys", ds.Len())
 			}
 		}
 	}
-}
-
-func (ds *DataStore) handleShutdown() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-c
-		log.Println("Shutdown signal received, saving data...")
-		ds.ticker.Stop()
-
-		ds.closeDone()
-
-		// Wait for autosave goroutine to finish
-		ds.wg.Wait()
-
-		if err := ds.saveToFile(); err != nil {
-			log.Printf("Error saving data on shutdown: %v", err)
-		}
-
-		os.Exit(0)
-	}()
-}
-
-// closeDone safely closes the done channel once
-func (ds *DataStore) closeDone() {
-	ds.once.Do(func() {
-		close(ds.done)
-	})
-}
-
-func (ds *DataStore) Close() error {
-	ds.ticker.Stop()
-	ds.closeDone()
-	ds.wg.Wait()
-	return ds.saveToFile()
 }
