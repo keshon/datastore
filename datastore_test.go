@@ -225,3 +225,43 @@ func TestAutoSave(t *testing.T) {
 		t.Fatal("expected key 'auto' in persisted file")
 	}
 }
+
+func TestFlush(t *testing.T) {
+	path := tempFile(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Long interval so only Flush can persist within the test.
+	ds, err := New(ctx, path, WithSaveInterval(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ds.Close()
+
+	_ = ds.Set("flushed", "now")
+	if err := ds.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("parse file: %v", err)
+	}
+	if _, ok := m["flushed"]; !ok {
+		t.Fatal("expected key 'flushed' in persisted file")
+	}
+}
+
+func TestFlushClosed(t *testing.T) {
+	ds, cancel := newStore(t)
+	cancel()
+	ds.Close()
+
+	if err := ds.Flush(); err != ErrClosed {
+		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+}

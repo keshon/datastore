@@ -46,6 +46,7 @@ type DataStore struct {
 	once   sync.Once
 	closed bool
 	wg     sync.WaitGroup
+	cancel context.CancelFunc
 }
 
 // New creates a new DataStore backed by filePath.
@@ -65,6 +66,10 @@ func New(ctx context.Context, filePath string, opts ...Option) (*DataStore, erro
 	if err := ds.initFile(); err != nil {
 		return nil, err
 	}
+
+	// Derive an internal cancel so Close can stop the autosave goroutine
+	// itself; callers no longer have to cancel ctx before calling Close.
+	ctx, ds.cancel = context.WithCancel(ctx)
 
 	ds.wg.Add(1)
 	go ds.autoSave(ctx)
@@ -136,6 +141,19 @@ func (ds *DataStore) Len() int {
 	return len(ds.data)
 }
 
+// Flush immediately persists the current snapshot to disk. Use it after
+// critical mutations that must survive a crash without waiting for the
+// periodic autosave.
+func (ds *DataStore) Flush() error {
+	ds.mu.RLock()
+	closed := ds.closed
+	ds.mu.RUnlock()
+	if closed {
+		return ErrClosed
+	}
+	return ds.saveToFile()
+}
+
 // Close performs a final save and marks the store as closed.
 // Subsequent writes will return ErrClosed. Safe to call multiple times.
 func (ds *DataStore) Close() error {
@@ -145,6 +163,7 @@ func (ds *DataStore) Close() error {
 		ds.closed = true
 		ds.mu.Unlock()
 
+		ds.cancel()  // stop the autosave goroutine
 		ds.wg.Wait() // wait for autoSave to exit
 
 		if err := ds.saveToFile(); err != nil {
