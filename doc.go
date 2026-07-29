@@ -17,6 +17,9 @@
 //     queue the confirmation email, all or nothing.
 //   - Typed collections and indexes, via generics.
 //   - Schema migrations, declared next to the collection and run at Open.
+//   - An audit trail: annotate a commit with Tx.Note and read it back with
+//     History, optionally across retained log segments.
+//   - A change feed (Watch) that can never slow a commit down.
 //   - A recovery report, so an application can tell whether the last Open lost
 //     anything instead of hoping somebody reads the log.
 //   - Verify, which rebuilds the indexes from the records and reports drift.
@@ -35,10 +38,14 @@
 //	  LOCK                  exclusive, held for the lifetime of the process
 //	  snapshot-000412.json  full state as of sequence 412
 //	  wal.log               framed, append-only, everything after that
+//	  archive-000412.log    a past log segment, kept only if History is enabled
 //
 // Recovery loads the newest valid snapshot and replays the log on top of it,
 // stopping at the first frame that is short, fails its checksum, or arrives out
 // of sequence. Compaction folds the log back into a new snapshot.
+//
+// Archived segments are history, never recovery input: their frames are already
+// in the snapshot, so replaying them would apply the same changes twice.
 //
 // # Usage
 //

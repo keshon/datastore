@@ -54,6 +54,11 @@ type walFrame struct {
 	Ops      []walOp           `json:"ops"`
 	Counters map[string]uint64 `json:"counters,omitempty"`
 
+	// Meta is the caller's annotations for this commit (see Tx.Note). Omitted
+	// when empty, so a frame from an unannotated write is byte-for-byte what it
+	// would have been before annotations existed.
+	Meta map[string]string `json:"meta,omitempty"`
+
 	// encodedSize is the on-disk size of this frame, filled in by append. It is
 	// reported through CommitStats and is not part of the payload.
 	encodedSize int `json:"-"`
@@ -207,6 +212,57 @@ func (w *wal) append(fr *walFrame, sync bool) error {
 		}
 	}
 	return nil
+}
+
+// scanFrames reads every intact frame of a log file in order, for History.
+//
+// It deliberately does not share code with replay. Replay is the crash-tested
+// recovery path: it truncates damage, tracks where and why it stopped, and its
+// behaviour is pinned by the crash suite. Scanning is read-only and stops
+// quietly at the first damaged frame, since a torn tail on the newest segment
+// is normal and simply means history ends there. Keeping them apart means a
+// change to history reading can never alter recovery; the cost is the fifteen
+// lines of framing below, which the constants keep honest.
+func scanFrames(path string, fn func(*walFrame) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("datastore: open %s: %w", filepath.Base(path), err)
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(int64(walHeaderSize), io.SeekStart); err != nil {
+		return fmt.Errorf("datastore: seek %s: %w", filepath.Base(path), err)
+	}
+	r := bufio.NewReaderSize(f, 1<<16)
+	head := make([]byte, frameHeaderSize)
+
+	for {
+		if _, err := io.ReadFull(r, head); err != nil {
+			return nil // clean end, or a torn header: history stops here
+		}
+		length := binary.LittleEndian.Uint32(head[0:])
+		want := binary.LittleEndian.Uint32(head[4:])
+		if length == 0 || length > maxFrameSize {
+			return nil
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil
+		}
+		if crc32.Checksum(payload, crcTable) != want {
+			return nil
+		}
+		var fr walFrame
+		if err := json.Unmarshal(payload, &fr); err != nil {
+			return nil
+		}
+		if err := fn(&fr); err != nil {
+			return err
+		}
+	}
 }
 
 // replayResult describes what recovery found.

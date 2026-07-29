@@ -231,6 +231,87 @@ enforces nothing — it logs when you cross the threshold and reports `Bytes` an
 `Budget` in `Stats`, which turns "OOM one morning" into a line in a log months
 earlier. `Options.OnCommit` receives a summary of every commit for metrics.
 
+## The log as an audit trail
+
+Every commit already records a sequence number and a timestamp. Attach context
+to it and you have an audit trail from data the store was writing anyway:
+
+```go
+db.Update(func(tx *datastore.Tx) error {
+    tx.Note("actor", "user:7")
+    tx.Note("reason", "refund")
+    return datastore.In(tx, orders).Put(o)
+})
+```
+
+Read it back with `History`, which reports each commit's annotations *and the
+values as they were written* — something the current state cannot tell you:
+
+```go
+err := db.History(0, 0, func(e datastore.HistoryEntry) error {
+    for _, op := range e.Ops {
+        fmt.Printf("%s seq=%d %s/%s by=%s reason=%s\n",
+            e.Time.Format(time.RFC3339), e.Seq,
+            op.Collection, op.Key, e.Meta["actor"], e.Meta["reason"])
+    }
+    return nil
+})
+```
+
+**How far back it reaches is a retention choice.** By default compaction
+discards the log, so only commits since the last compaction are visible. Set
+either bound to keep segments instead:
+
+```go
+datastore.Options{
+    HistorySegments: 20,             // keep the newest 20 compacted segments
+    HistoryFor:      30 * 24 * time.Hour, // ...and nothing older than 30 days
+}
+```
+
+Compaction then renames `wal.log` aside as `archive-<seq>.log` rather than
+emptying it. Archives are history only — their frames are already in the
+snapshot, so recovery never replays them, and deleting one costs you history,
+never state. `Stats` reports `ArchiveSegments` and `ArchiveBytes`.
+
+## Watching for changes
+
+```go
+sub := db.Watch(datastore.WatchOptions{Collections: []string{"orders"}})
+defer sub.Close()
+
+for ev := range sub.Events() {
+    if ev.Dropped > 0 {
+        // we fell behind by ev.Dropped events: re-read what we care about
+    }
+    fmt.Println(ev.Seq, ev.Collection, ev.Key, ev.Delete)
+}
+```
+
+Events are delivered after the change is both durable and applied, so a
+subscriber that reads the database on receipt sees it, and they arrive in commit
+order.
+
+**A subscriber can never slow a commit down.** Delivery is best-effort into a
+bounded queue; a subscriber that stops reading has events dropped and is told how
+many, rather than blocking an fsync. A dropped event is a nuisance, a blocked
+write is an outage.
+
+`Watch` does not replay the past — but it records the sequence it started at, so
+catching up is a composition rather than a feature:
+
+```go
+sub := db.Watch(datastore.WatchOptions{}) // events start queueing here
+defer sub.Close()
+
+db.History(0, sub.StartSeq(), func(e datastore.HistoryEntry) error { ... }) // the past
+for ev := range sub.Events() { ... }                                        // then live
+```
+
+Subscribing *first* is what closes the gap: everything up to `StartSeq` comes
+from `History`, everything after it from the feed, with nothing missed and
+nothing delivered twice.
+
 ## Reading from a second process
 
 Only one process may *own* a directory. A second one can still read it:
@@ -283,6 +364,8 @@ application rather than beside it.
 | `(*DB) Stats() Stats` | Point-in-time summary for an admin screen or health check. |
 | `(*DB) Recovery() RecoveryReport` | What the last `Open` found — and what it could not use. |
 | `(*DB) Verify() error` | Rebuilds every index from the records and reports disagreements. |
+| `(*DB) History(from, to, fn) error` | Replays past commits, with annotations and the values as written. |
+| `(*DB) Watch(WatchOptions) *Subscription` | Live change feed; never blocks a commit. |
 | `(*DB) ReadOnly() bool` / `(*DB) Dir() string` | How it was opened, and where. |
 
 ### Collections and transactions
@@ -298,6 +381,7 @@ application rather than beside it.
 | `(*Collection[T]) Keys() []string` / `Len() int` | Sorted key snapshot; record count. |
 | `In[T](tx, c) *TxCollection[T]` | Scopes a collection to a transaction. |
 | `(*TxCollection[T]) Get / Put / Delete` | Reads see this transaction's own uncommitted writes. |
+| `(*Tx) Note(key, value string)` | Attaches context to the commit, readable later through `History`. |
 | `(*Tx) NextID(name string) uint64` | Monotonic counter, permanent only on commit. |
 | `(*Tx) NextInPeriod(name, t, layout) (string, uint64)` | A counter that restarts each period — `"0601"` monthly, `"2006"` yearly. |
 
@@ -327,6 +411,8 @@ All three must be declared before `Open`.
 | `MaxBytes` | `0` (off) | Size the dataset is expected to stay under. Warns; enforces nothing. |
 | `WarnAtPercent` | `80` | Fraction of `MaxBytes` that triggers the warning. |
 | `OnCommit` | none | Called with a `CommitStats` after each commit, for metrics. |
+| `HistorySegments` | `0` (off) | Compacted log segments to retain for `History`. |
+| `HistoryFor` | `0` (off) | Maximum age of a retained segment. |
 
 ### Errors
 

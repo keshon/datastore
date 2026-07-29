@@ -30,6 +30,26 @@ type Tx struct {
 
 	writes   map[string]map[string]pendingOp
 	counters map[string]uint64
+	meta     map[string]string
+}
+
+// Note attaches context to this transaction — who asked for the change and why.
+//
+// The pair is recorded in the log alongside the commit and read back through
+// History, which is what turns the log into an audit trail: "order 41 was
+// refunded by user 7 on Tuesday" is answerable from data the store was already
+// writing. A rolled-back transaction records nothing.
+//
+// Notes describe the commit, not any single record. Later calls with the same
+// key replace earlier ones.
+func (tx *Tx) Note(key, value string) {
+	if !tx.write || tx.done {
+		return // a read-only or finished transaction commits nothing
+	}
+	if tx.meta == nil {
+		tx.meta = make(map[string]string, 4)
+	}
+	tx.meta[key] = value
 }
 
 // Update runs fn in a read-write transaction and commits if it returns nil.
@@ -182,6 +202,12 @@ func (db *DB) commit(tx *Tx) error {
 			frame.Counters[k] = v
 		}
 	}
+	if len(tx.meta) > 0 {
+		frame.Meta = make(map[string]string, len(tx.meta))
+		for k, v := range tx.meta {
+			frame.Meta[k] = v
+		}
+	}
 
 	sync := db.opts.Sync == SyncAlways
 	started := time.Now()
@@ -216,6 +242,10 @@ func (db *DB) commit(tx *Tx) error {
 	walBytes := db.wal.size
 	db.checkBudgetLocked()
 	db.mu.Unlock()
+
+	// The change is durable and applied, so a subscriber reading the database on
+	// receipt sees it. Dispatch never blocks (see watch.go).
+	db.dispatch(frame)
 
 	if db.opts.OnCommit != nil {
 		db.opts.OnCommit(CommitStats{

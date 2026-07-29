@@ -80,6 +80,18 @@ type Options struct {
 	// of the work. It runs on the committing goroutine, so keep it quick and do
 	// not touch the database from it — record a metric and return.
 	OnCommit func(CommitStats)
+
+	// HistorySegments and HistoryFor retain compacted log segments as
+	// archive-<seq>.log rather than discarding them, so History can read past
+	// commits and their annotations. Retention is bounded by count and by age,
+	// whichever bites first; a zero bound is unbounded by that measure, and
+	// leaving both zero (the default) keeps no history at all.
+	//
+	// This trades disk for an audit trail. Archives are never replayed — their
+	// frames are already in the snapshot — so losing them costs history, never
+	// state.
+	HistorySegments int
+	HistoryFor      time.Duration
 }
 
 // CommitStats describes one committed transaction, for metrics.
@@ -175,6 +187,11 @@ type DB struct {
 	// overBudget tracks whether the budget warning has already been given, so a
 	// dataset sitting at the threshold does not log on every commit.
 	overBudget bool
+
+	// subs are the live change-feed subscriptions, guarded separately from the
+	// state lock so dispatching never contends with readers.
+	subsMu sync.RWMutex
+	subs   []*Subscription
 }
 
 // New prepares a database. It performs no I/O; register collections and
@@ -487,6 +504,7 @@ func (db *DB) Close() error {
 
 	close(db.stop)
 	db.wg.Wait()
+	db.closeSubscriptions()
 
 	// A reader owns nothing on disk: no compaction, no lock to release.
 	var err error
@@ -576,11 +594,22 @@ func (db *DB) compactExclusive() error {
 	if err := writeSnapshot(db.opts.Dir, snap); err != nil {
 		return err
 	}
-	if err := db.wal.reset(); err != nil {
+	// The snapshot is durable, so the log's contents are now redundant for
+	// recovery: either empty it, or keep it aside as history.
+	if db.archivingEnabled() {
+		if err := db.archiveLogLocked(db.seq); err != nil {
+			return err
+		}
+	} else if err := db.wal.reset(); err != nil {
 		return err
 	}
 	if err := pruneSnapshots(db.opts.Dir, db.opts.KeepSnapshots); err != nil {
 		return err
+	}
+	if db.archivingEnabled() {
+		if err := db.pruneArchives(db.opts.Clock()); err != nil {
+			return err
+		}
 	}
 
 	db.lastCompact = db.opts.Clock()
@@ -691,6 +720,11 @@ type Stats struct {
 	// still does.
 	Bytes  int64
 	Budget int64
+
+	// ArchiveSegments and ArchiveBytes describe retained history on disk (see
+	// Options.HistorySegments). Zero when archiving is off.
+	ArchiveSegments int
+	ArchiveBytes    int64
 }
 
 func (db *DB) Stats() Stats {
@@ -718,5 +752,8 @@ func (db *DB) Stats() Stats {
 	}
 	s.Bytes = db.bytesLocked()
 	s.Budget = db.opts.MaxBytes
+	if db.archivingEnabled() {
+		s.ArchiveSegments, s.ArchiveBytes = db.archiveStats()
+	}
 	return s
 }
