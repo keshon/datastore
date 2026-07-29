@@ -1,267 +1,368 @@
 package datastore
 
 import (
-	"context"
-	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
-	"sync"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
-func tempFile(t *testing.T) string {
+type order struct {
+	ID       string   `json:"id"`
+	Customer string   `json:"customer"`
+	Status   string   `json:"status"`
+	Email    string   `json:"email"`
+	Created  int64    `json:"created"`
+	Total    int      `json:"total"`
+	Tags     []string `json:"tags,omitempty"`
+}
+
+func (o *order) Key() string { return o.ID }
+
+type fixture struct {
+	db       *DB
+	orders   *Collection[*order]
+	byStatus *Index[*order]
+	byTag    *Index[*order]
+	byEmail  *UniqueIndex[*order]
+	byDate   *SortedIndex[*order]
+	dir      string
+}
+
+func newFixture(t *testing.T, opts ...func(*Options)) *fixture {
 	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "datastore-*.json")
-	if err != nil {
-		t.Fatalf("create temp file: %v", err)
-	}
-	f.Close()
-	os.Remove(f.Name()) // let New() create it fresh
-	return f.Name()
+	dir := t.TempDir()
+	return openFixture(t, dir, opts...)
 }
 
-func newStore(t *testing.T) (*DataStore, context.CancelFunc) {
+func openFixture(t *testing.T, dir string, opts ...func(*Options)) *fixture {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	ds, err := New(ctx, tempFile(t), WithSaveInterval(time.Hour))
-	if err != nil {
-		cancel()
-		t.Fatalf("New: %v", err)
+
+	o := Options{Dir: dir, Sync: SyncAlways, CompactInterval: -1}
+	for _, fn := range opts {
+		fn(&o)
 	}
-	t.Cleanup(func() {
-		cancel()
-		ds.Close()
-	})
-	return ds, cancel
+
+	db := New(o)
+	f := &fixture{db: db, dir: dir}
+	f.orders = Register[*order](db, "orders")
+	f.byStatus = AddIndex(f.orders, "status", func(o *order) []string { return []string{o.Status} })
+	f.byTag = AddIndex(f.orders, "tag", func(o *order) []string { return o.Tags })
+	f.byEmail = AddUnique(f.orders, "email", func(o *order) string { return o.Email })
+	f.byDate = AddSorted(f.orders, "date", func(o *order) int64 { return o.Created })
+
+	if err := db.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return f
 }
 
-func TestSetGet(t *testing.T) {
-	ds, _ := newStore(t)
-
-	if err := ds.Set("name", "Alice"); err != nil {
-		t.Fatalf("Set: %v", err)
+func mkOrder(id string, rest ...func(*order)) *order {
+	o := &order{ID: id, Customer: "c1", Status: "new", Created: 1000, Total: 100}
+	for _, fn := range rest {
+		fn(o)
 	}
-
-	var got string
-	ok, err := ds.Get("name", &got)
-	if err != nil || !ok || got != "Alice" {
-		t.Fatalf("Get: ok=%v err=%v got=%q", ok, err, got)
-	}
+	return o
 }
 
-func TestGetMissing(t *testing.T) {
-	ds, _ := newStore(t)
-
-	var v string
-	ok, err := ds.Get("nope", &v)
-	if ok || err != nil {
-		t.Fatalf("expected (false, nil), got (%v, %v)", ok, err)
-	}
-}
-
-func TestDelete(t *testing.T) {
-	ds, _ := newStore(t)
-
-	_ = ds.Set("x", 1)
-	_ = ds.Delete("x")
-
-	var v int
-	ok, _ := ds.Get("x", &v)
-	if ok {
-		t.Fatal("key should be deleted")
+func mustPut(t *testing.T, c *Collection[*order], o *order) {
+	t.Helper()
+	if err := c.Put(o); err != nil {
+		t.Fatalf("Put(%s): %v", o.ID, err)
 	}
 }
 
-func TestKeys(t *testing.T) {
-	ds, _ := newStore(t)
+// release drops this process's hold on a database without the orderly shutdown
+// Close performs. It is how the tests simulate a process that simply stopped
+// existing: no final snapshot, no compaction, just the log exactly as the last
+// commit left it.
+//
+// Recovery from that state is the whole point of the package, so most durability
+// tests want this rather than Close.
+func release(t *testing.T, db *DB) {
+	t.Helper()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-	_ = ds.Set("a", 1)
-	_ = ds.Set("b", 2)
+	if db.wal != nil {
+		if err := db.wal.close(); err != nil {
+			t.Fatalf("release wal: %v", err)
+		}
+		db.wal = nil
+	}
+	if db.lock != nil {
+		if err := db.lock.release(); err != nil {
+			t.Fatalf("release lock: %v", err)
+		}
+		db.lock = nil
+	}
+	db.opened = false
+	db.closed = true // stop the registered Cleanup from doing anything
+}
 
-	keys := ds.Keys()
-	if len(keys) != 2 {
-		t.Fatalf("expected 2 keys, got %d", len(keys))
+// --- basics ---------------------------------------------------------------
+
+func TestPutGetDelete(t *testing.T) {
+	f := newFixture(t)
+
+	mustPut(t, f.orders, mkOrder("1", func(o *order) { o.Total = 250 }))
+
+	got, ok := f.orders.Get("1")
+	if !ok {
+		t.Fatal("Get: not found after Put")
+	}
+	if got.Total != 250 {
+		t.Errorf("Total = %d, want 250", got.Total)
+	}
+	if f.orders.Len() != 1 {
+		t.Errorf("Len = %d, want 1", f.orders.Len())
+	}
+
+	if err := f.orders.Delete("1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, ok := f.orders.Get("1"); ok {
+		t.Error("Get: still found after Delete")
+	}
+	if err := f.orders.Delete("nonexistent"); err != nil {
+		t.Errorf("Delete of an absent key = %v, want nil", err)
 	}
 }
 
-func TestLen(t *testing.T) {
-	ds, _ := newStore(t)
+// Get must hand back a private copy. If it returned the stored pointer, a
+// caller mutating it would change the data without the log or the indexes ever
+// hearing about it — the exact failure this package is built to make impossible.
+func TestGetReturnsACopy(t *testing.T) {
+	f := newFixture(t)
+	mustPut(t, f.orders, mkOrder("1", func(o *order) { o.Status = "new" }))
 
-	_ = ds.Set("a", 1)
-	_ = ds.Set("b", 2)
-	_ = ds.Delete("a")
+	first, _ := f.orders.Get("1")
+	first.Status = "tampered"
+	first.Tags = append(first.Tags, "tampered")
 
-	if ds.Len() != 1 {
-		t.Fatalf("expected len=1, got %d", ds.Len())
+	second, _ := f.orders.Get("1")
+	if second.Status != "new" {
+		t.Errorf("Status = %q, want %q — Get leaked a shared pointer", second.Status, "new")
+	}
+	if len(second.Tags) != 0 {
+		t.Errorf("Tags = %v, want empty — Get leaked a shared pointer", second.Tags)
 	}
 }
 
-func TestPersistence(t *testing.T) {
-	path := tempFile(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ds, err := New(ctx, path, WithSaveInterval(time.Hour))
-	if err != nil {
-		t.Fatal(err)
+func TestEmptyKeyRejected(t *testing.T) {
+	f := newFixture(t)
+	err := f.orders.Put(&order{ID: ""})
+	if !errors.Is(err, ErrEmptyKey) {
+		t.Errorf("Put with an empty key = %v, want ErrEmptyKey", err)
 	}
-	_ = ds.Set("key", "value")
-	cancel()
-	if err := ds.Close(); err != nil {
+}
+
+func TestAllIteratesInKeyOrder(t *testing.T) {
+	f := newFixture(t)
+	for _, id := range []string{"c", "a", "b"} {
+		mustPut(t, f.orders, mkOrder(id))
+	}
+	var seen []string
+	for o := range f.orders.All() {
+		seen = append(seen, o.ID)
+	}
+	if strings.Join(seen, ",") != "a,b,c" {
+		t.Errorf("All order = %v, want [a b c]", seen)
+	}
+}
+
+// --- durability -----------------------------------------------------------
+
+func TestStateSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	f := openFixture(t, dir)
+	for i := 1; i <= 5; i++ {
+		mustPut(t, f.orders, mkOrder(fmt.Sprint(i), func(o *order) { o.Total = i * 10 }))
+	}
+	if err := f.db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Reopen
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	defer cancel2()
-	ds2, err := New(ctx2, path, WithSaveInterval(time.Hour))
+	g := openFixture(t, dir)
+	if g.orders.Len() != 5 {
+		t.Fatalf("after reopen Len = %d, want 5", g.orders.Len())
+	}
+	got, ok := g.orders.Get("3")
+	if !ok || got.Total != 30 {
+		t.Errorf("after reopen order 3 = %+v, want Total 30", got)
+	}
+}
+
+// Closing writes a snapshot, which is the easy path. The interesting one is a
+// process that never got to close: state must come back from the log alone.
+func TestStateSurvivesWithoutClose(t *testing.T) {
+	dir := t.TempDir()
+
+	db := New(Options{Dir: dir, Sync: SyncAlways, CompactInterval: -1})
+	orders := Register[*order](db, "orders")
+	if err := db.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 1; i <= 3; i++ {
+		mustPut(t, orders, mkOrder(fmt.Sprint(i)))
+	}
+	release(t, db) // no snapshot: recovery has to read the log
+
+	g := openFixture(t, dir)
+	if g.orders.Len() != 3 {
+		t.Errorf("recovered %d orders from the log, want 3", g.orders.Len())
+	}
+}
+
+func TestCompactionPreservesEverything(t *testing.T) {
+	f := newFixture(t)
+	for i := 1; i <= 10; i++ {
+		mustPut(t, f.orders, mkOrder(fmt.Sprint(i)))
+	}
+	if err := f.orders.Delete("5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	if got := f.db.Stats().WALBytes; got != int64(walHeaderSize) {
+		t.Errorf("WAL is %d bytes after compaction, want %d", got, walHeaderSize)
+	}
+	if f.orders.Len() != 9 {
+		t.Errorf("Len = %d after compaction, want 9", f.orders.Len())
+	}
+	if _, ok := f.orders.Get("5"); ok {
+		t.Error("a deleted record came back through compaction")
+	}
+}
+
+func TestCompactionKeepsAPreviousSnapshot(t *testing.T) {
+	f := newFixture(t)
+	for i := 0; i < 4; i++ {
+		mustPut(t, f.orders, mkOrder(fmt.Sprint(i)))
+		if err := f.db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seqs, err := listSnapshots(f.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ds2.Close()
-
-	var got string
-	ok, err := ds2.Get("key", &got)
-	if !ok || err != nil || got != "value" {
-		t.Fatalf("persistence failed: ok=%v err=%v got=%q", ok, err, got)
+	// Keeping the previous one is what makes a crash between installing a
+	// snapshot and truncating the log survivable.
+	if len(seqs) != 2 {
+		t.Errorf("kept %d snapshots (%v), want 2", len(seqs), seqs)
 	}
 }
 
-func TestTypedValues(t *testing.T) {
-	ds, _ := newStore(t)
+// A collection that this build does not register must survive untouched.
+// Otherwise commenting out one Register call and deploying would delete a
+// table at the next compaction, with no error and no way back.
+func TestUnregisteredCollectionSurvivesCompaction(t *testing.T) {
+	dir := t.TempDir()
 
-	type Point struct {
-		X, Y int
-	}
-	_ = ds.Set("pt", Point{1, 2})
-
-	var got Point
-	ok, err := ds.Get("pt", &got)
-	if !ok || err != nil || got.X != 1 || got.Y != 2 {
-		t.Fatalf("typed value: ok=%v err=%v got=%+v", ok, err, got)
-	}
-}
-
-func TestNoFloat64Surprise(t *testing.T) {
-	// Without json.RawMessage storage, integers become float64 after a
-	// save/reload cycle. This test ensures that does not happen.
-	path := tempFile(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ds, _ := New(ctx, path, WithSaveInterval(time.Hour))
-	_ = ds.Set("n", 42)
-	cancel()
-	ds.Close()
-
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	defer cancel2()
-	ds2, _ := New(ctx2, path)
-	defer ds2.Close()
-
-	var n int
-	ok, err := ds2.Get("n", &n)
-	if !ok || err != nil || n != 42 {
-		t.Fatalf("expected int 42, got ok=%v err=%v n=%v", ok, err, n)
-	}
-}
-
-func TestConcurrentAccess(t *testing.T) {
-	ds, _ := newStore(t)
-
-	const goroutines = 50
-	var wg sync.WaitGroup
-	wg.Add(goroutines * 2)
-
-	for i := 0; i < goroutines; i++ {
-		go func(i int) {
-			defer wg.Done()
-			_ = ds.Set("key", i)
-		}(i)
-
-		go func() {
-			defer wg.Done()
-			var v int
-			_, _ = ds.Get("key", &v)
-		}()
-	}
-
-	wg.Wait()
-}
-
-func TestErrClosedOnWrite(t *testing.T) {
-	ds, cancel := newStore(t)
-	cancel()
-	ds.Close()
-
-	if err := ds.Set("k", "v"); err != ErrClosed {
-		t.Fatalf("expected ErrClosed, got %v", err)
-	}
-}
-
-func TestAutoSave(t *testing.T) {
-	path := tempFile(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ds, err := New(ctx, path, WithSaveInterval(50*time.Millisecond))
-	if err != nil {
+	full := New(Options{Dir: dir, Sync: SyncAlways, CompactInterval: -1})
+	orders := Register[*order](full, "orders")
+	archive := Register[*order](full, "archive")
+	if err := full.Open(); err != nil {
 		t.Fatal(err)
 	}
-	defer ds.Close()
-
-	_ = ds.Set("auto", "saved")
-
-	time.Sleep(200 * time.Millisecond)
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file: %v", err)
-	}
-
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("parse file: %v", err)
-	}
-	if _, ok := m["auto"]; !ok {
-		t.Fatal("expected key 'auto' in persisted file")
-	}
-}
-
-func TestFlush(t *testing.T) {
-	path := tempFile(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Long interval so only Flush can persist within the test.
-	ds, err := New(ctx, path, WithSaveInterval(time.Hour))
-	if err != nil {
+	mustPut(t, orders, mkOrder("1"))
+	mustPut(t, archive, mkOrder("old-1"))
+	if err := full.Close(); err != nil {
 		t.Fatal(err)
 	}
-	defer ds.Close()
 
-	_ = ds.Set("flushed", "now")
-	if err := ds.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
+	// Reopen without registering "archive", write, and compact.
+	partial := New(Options{Dir: dir, Sync: SyncAlways, CompactInterval: -1})
+	orders2 := Register[*order](partial, "orders")
+	if err := partial.Open(); err != nil {
+		t.Fatal(err)
+	}
+	mustPut(t, orders2, mkOrder("2"))
+	if got := partial.Stats().Orphans["archive"]; got != 1 {
+		t.Errorf("orphan count = %d, want 1", got)
+	}
+	if err := partial.Close(); err != nil { // Close compacts
+		t.Fatal(err)
 	}
 
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file: %v", err)
+	// Register it again: the data must still be there.
+	back := New(Options{Dir: dir, Sync: SyncAlways, CompactInterval: -1})
+	_ = Register[*order](back, "orders")
+	archive2 := Register[*order](back, "archive")
+	if err := back.Open(); err != nil {
+		t.Fatal(err)
 	}
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("parse file: %v", err)
-	}
-	if _, ok := m["flushed"]; !ok {
-		t.Fatal("expected key 'flushed' in persisted file")
+	defer back.Close()
+
+	if _, ok := archive2.Get("old-1"); !ok {
+		t.Error("an unregistered collection was destroyed by compaction")
 	}
 }
 
-func TestFlushClosed(t *testing.T) {
-	ds, cancel := newStore(t)
-	cancel()
-	ds.Close()
-
-	if err := ds.Flush(); err != ErrClosed {
-		t.Fatalf("expected ErrClosed, got %v", err)
+func TestBackupIsARestorableDirectory(t *testing.T) {
+	f := newFixture(t)
+	for i := 1; i <= 3; i++ {
+		mustPut(t, f.orders, mkOrder(fmt.Sprint(i)))
 	}
+
+	dst := filepath.Join(t.TempDir(), "backup")
+	if err := f.db.Backup(dst); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+
+	restored := openFixture(t, dst)
+	if restored.orders.Len() != 3 {
+		t.Errorf("restored %d orders, want 3", restored.orders.Len())
+	}
+}
+
+// --- locking --------------------------------------------------------------
+
+func TestSecondOpenIsRefused(t *testing.T) {
+	f := newFixture(t)
+
+	second := New(Options{Dir: f.dir})
+	_ = Register[*order](second, "orders")
+	err := second.Open()
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Open = %v, want ErrLocked", err)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprint(os.Getpid())) {
+		t.Errorf("error should name the holding pid, got: %v", err)
+	}
+}
+
+func TestRegisterAfterOpenPanics(t *testing.T) {
+	f := newFixture(t)
+	defer func() {
+		if recover() == nil {
+			t.Error("Register after Open should panic")
+		}
+	}()
+	_ = Register[*order](f.db, "late")
+}
+
+func TestReentrantUpdatePanics(t *testing.T) {
+	f := newFixture(t, func(o *Options) { o.WriteTimeout = 150 * time.Millisecond })
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("a nested Update should panic rather than deadlock")
+		}
+		if !strings.Contains(fmt.Sprint(r), "inside another Update") {
+			t.Errorf("panic should explain the cause, got: %v", r)
+		}
+	}()
+
+	_ = f.db.Update(func(tx *Tx) error {
+		return f.db.Update(func(*Tx) error { return nil })
+	})
 }
