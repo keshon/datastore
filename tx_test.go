@@ -249,7 +249,7 @@ func TestOrderNumberFormatAndMonthlyReset(t *testing.T) {
 	var nums []string
 	for _, when := range []time.Time{jul, jul, aug, jul} {
 		if err := f.db.Update(func(tx *Tx) error {
-			n := tx.NextOrderNum(when)
+			_, seq := tx.NextInPeriod("order", when, "0601"); n := fmt.Sprintf("%s/%d", when.Format("0601"), seq)
 			nums = append(nums, n)
 			return In(tx, f.orders).Put(mkOrder(n))
 		}); err != nil {
@@ -323,4 +323,34 @@ func TestCollectionFromAnotherDatabasePanics(t *testing.T) {
 		_ = In(tx, other.orders)
 		return nil
 	})
+}
+
+// A re-entrant Update can never proceed, so it must be reported at once rather
+// than after WriteTimeout. Collection.Put is the usual accidental route in.
+func TestReentrantUpdatePanicsImmediately(t *testing.T) {
+	f := newFixture(t)
+
+	done := make(chan any, 1)
+	start := time.Now()
+	go func() {
+		defer func() { done <- recover() }()
+		_ = f.db.Update(func(tx *Tx) error {
+			return f.orders.Put(mkOrder("boom")) // its own transaction: deadlock
+		})
+	}()
+
+	select {
+	case r := <-done:
+		if r == nil {
+			t.Fatal("expected a panic from the re-entrant Update")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("panic took %s; it should be immediate, not after WriteTimeout", elapsed)
+		}
+		if msg, _ := r.(string); !strings.Contains(msg, "inside another Update") {
+			t.Fatalf("panic message should explain the cause, got: %v", r)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("re-entrant Update hung instead of panicking")
+	}
 }

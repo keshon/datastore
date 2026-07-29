@@ -53,6 +53,10 @@ type walFrame struct {
 	TS       int64             `json:"ts"`
 	Ops      []walOp           `json:"ops"`
 	Counters map[string]uint64 `json:"counters,omitempty"`
+
+	// encodedSize is the on-disk size of this frame, filled in by append. It is
+	// reported through CommitStats and is not part of the payload.
+	encodedSize int `json:"-"`
 }
 
 // wal is the append-only log.
@@ -65,6 +69,11 @@ type wal struct {
 	f    *os.File
 	path string
 	size int64
+
+	// readOnly suppresses every write, including the truncation of a damaged
+	// tail during replay. A reader has no business editing a log another process
+	// owns; it stops at the damage and reports it instead.
+	readOnly bool
 }
 
 func openWAL(dir string) (*wal, error) {
@@ -89,6 +98,45 @@ func openWAL(dir string) (*wal, error) {
 			return nil, err
 		}
 		return w, nil
+	}
+
+	header := make([]byte, walHeaderSize)
+	if _, err := f.ReadAt(header, 0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("datastore: read wal header: %w", err)
+	}
+	if string(header[:len(walMagic)]) != walMagic {
+		f.Close()
+		return nil, fmt.Errorf("datastore: %s is not a datastore log", path)
+	}
+	if v := binary.LittleEndian.Uint16(header[len(walMagic):]); v != walVersion {
+		f.Close()
+		return nil, fmt.Errorf("datastore: log version %d, this build understands %d", v, walVersion)
+	}
+	return w, nil
+}
+
+// openWALRead opens the log for reading only, tolerating a directory that has
+// no log yet (a database that has only ever been compacted).
+func openWALRead(dir string) (*wal, error) {
+	path := filepath.Join(dir, walName)
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &wal{path: path, readOnly: true}, nil
+		}
+		return nil, fmt.Errorf("datastore: open wal: %w", err)
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("datastore: stat wal: %w", err)
+	}
+
+	w := &wal{f: f, path: path, size: info.Size(), readOnly: true}
+	if w.size < int64(walHeaderSize) {
+		return w, nil // nothing usable in it yet
 	}
 
 	header := make([]byte, walHeaderSize)
@@ -142,6 +190,7 @@ func (w *wal) append(fr *walFrame, sync bool) error {
 	binary.LittleEndian.PutUint32(buf[0:], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(buf[4:], crc32.Checksum(payload, crcTable))
 	copy(buf[frameHeaderSize:], payload)
+	fr.encodedSize = len(buf)
 
 	n, err := w.f.WriteAt(buf, w.size)
 	if err != nil {
@@ -177,6 +226,10 @@ type replayResult struct {
 // be trusted to apply to the state we think we have.
 func (w *wal) replay(minSeq uint64, fn func(*walFrame) error) (replayResult, error) {
 	var res replayResult
+
+	if w.f == nil {
+		return res, nil // read-only open of a directory with no log yet
+	}
 
 	if _, err := w.f.Seek(int64(walHeaderSize), io.SeekStart); err != nil {
 		return res, fmt.Errorf("datastore: seek wal: %w", err)
@@ -237,11 +290,13 @@ func (w *wal) replay(minSeq uint64, fn func(*walFrame) error) (replayResult, err
 
 	if res.Truncated {
 		res.At = offset
-		if err := w.f.Truncate(offset); err != nil {
-			return res, fmt.Errorf("datastore: truncate damaged wal at %d: %w", offset, err)
-		}
-		if err := w.f.Sync(); err != nil {
-			return res, fmt.Errorf("datastore: sync truncated wal: %w", err)
+		if !w.readOnly {
+			if err := w.f.Truncate(offset); err != nil {
+				return res, fmt.Errorf("datastore: truncate damaged wal at %d: %w", offset, err)
+			}
+			if err := w.f.Sync(); err != nil {
+				return res, fmt.Errorf("datastore: sync truncated wal: %w", err)
+			}
 		}
 	}
 	w.size = offset

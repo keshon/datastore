@@ -2,10 +2,10 @@
 //
 // It holds everything in memory and appends every commit to a write-ahead log
 // before acknowledging it. That combination is only reasonable because of a
-// specific assumption: the whole dataset fits comfortably in RAM. For the shop
-// this was written for, that is a few hundred kilobytes today and perhaps
-// twenty megabytes in a decade. The moment that assumption stops holding, the
-// right move is to export to something else — the on-disk format is plain JSON
+// specific assumption: the whole dataset fits comfortably in RAM — a few
+// hundred kilobytes today, perhaps twenty megabytes in a decade. Set
+// Options.MaxBytes and the store will tell you long before that assumption
+// stops holding. When it does, export: the on-disk format is plain JSON
 // precisely so that stays easy.
 //
 // # What it gives you
@@ -16,13 +16,18 @@
 //     write the order, debit the loyalty balance, consume the promo code, and
 //     queue the confirmation email, all or nothing.
 //   - Typed collections and indexes, via generics.
+//   - Schema migrations, declared next to the collection and run at Open.
+//   - A recovery report, so an application can tell whether the last Open lost
+//     anything instead of hoping somebody reads the log.
+//   - Verify, which rebuilds the indexes from the records and reports drift.
+//   - Read-only opens, so a second process can inspect a live database.
 //   - Backup by copying a directory.
 //
 // # What it deliberately does not give you
 //
-// No query language, no joins, no key range scans, no MVCC, no replication, no
-// multi-process access, and no automatic schema migration. Declare an index or
-// write a Go loop; at these volumes a linear scan is measured in microseconds.
+// No query language, no joins, no key range scans, no MVCC, no replication, and
+// no multi-process writing. Declare an index or write a Go loop; at these
+// volumes a linear scan is measured in microseconds.
 //
 // # Layout on disk
 //

@@ -1,6 +1,7 @@
 package datastore
 
 import (
+	"fmt"
 	"sort"
 )
 
@@ -309,6 +310,105 @@ func (s *SortedIndex[T]) Len() int {
 	s.coll.db.mu.RLock()
 	defer s.coll.db.mu.RUnlock()
 	return len(s.entries)
+}
+
+// --- verification ---------------------------------------------------------
+//
+// Each index rebuilds itself from the given records and reports where the live
+// structure disagrees. The records are the source of truth: indexes are derived
+// state maintained incrementally, and incremental maintenance is exactly the
+// kind of thing that can drift silently. See DB.Verify.
+
+func (i *Index[T]) verify(fresh map[string]T) []string {
+	want := make(map[string]map[string]struct{})
+	for key, v := range fresh {
+		for _, t := range i.terms(v) {
+			if want[t] == nil {
+				want[t] = make(map[string]struct{})
+			}
+			want[t][key] = struct{}{}
+		}
+	}
+
+	var problems []string
+	for term, keys := range want {
+		got := i.byTerm[term]
+		for k := range keys {
+			if _, ok := got[k]; !ok {
+				problems = append(problems, describeIndexDrift(i.coll.collName(), i.name, term, k, "missing from the index"))
+			}
+		}
+	}
+	for term, keys := range i.byTerm {
+		for k := range keys {
+			if _, ok := want[term][k]; !ok {
+				problems = append(problems, describeIndexDrift(i.coll.collName(), i.name, term, k, "indexed but not produced by the record"))
+			}
+		}
+	}
+	return problems
+}
+
+func (u *UniqueIndex[T]) verify(fresh map[string]T) []string {
+	var problems []string
+	want := make(map[string]string, len(fresh))
+	for key, v := range fresh {
+		t := u.term(v)
+		if t == "" {
+			continue
+		}
+		if other, clash := want[t]; clash {
+			problems = append(problems, describeIndexDrift(u.coll.collName(), u.name, t, key,
+				"duplicate term also held by "+other+"; the unique constraint is violated in the data"))
+			continue
+		}
+		want[t] = key
+	}
+
+	for term, key := range want {
+		if got, ok := u.byTerm[term]; !ok || got != key {
+			problems = append(problems, describeIndexDrift(u.coll.collName(), u.name, term, key,
+				"index points at "+got+" instead"))
+		}
+	}
+	for term, key := range u.byTerm {
+		if _, ok := want[term]; !ok {
+			problems = append(problems, describeIndexDrift(u.coll.collName(), u.name, term, key,
+				"indexed but no record produces the term"))
+		}
+	}
+	return problems
+}
+
+func (s *SortedIndex[T]) verify(fresh map[string]T) []string {
+	want := make([]sortedEntry, 0, len(fresh))
+	for key, v := range fresh {
+		want = append(want, sortedEntry{n: s.key(v), key: key})
+	}
+	sort.Slice(want, func(a, b int) bool {
+		if want[a].n != want[b].n {
+			return want[a].n < want[b].n
+		}
+		return want[a].key < want[b].key
+	})
+
+	if len(want) != len(s.entries) {
+		return []string{fmt.Sprintf("%s.%s: index holds %d entries, records imply %d",
+			s.coll.collName(), s.name, len(s.entries), len(want))}
+	}
+	var problems []string
+	for i := range want {
+		if want[i] != s.entries[i] {
+			problems = append(problems, fmt.Sprintf(
+				"%s.%s: position %d holds (%d,%q), records imply (%d,%q); the order has drifted",
+				s.coll.collName(), s.name, i, s.entries[i].n, s.entries[i].key, want[i].n, want[i].key))
+		}
+	}
+	return problems
+}
+
+func describeIndexDrift(coll, index, term, key, what string) string {
+	return fmt.Sprintf("%s.%s: term %q / record %q: %s", coll, index, term, key, what)
 }
 
 func window(entries []sortedEntry, limit, offset int, reverse bool) []sortedEntry {

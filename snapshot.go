@@ -21,10 +21,16 @@ func snapshotName(seq uint64) string {
 }
 
 // snapshotFile is the full state at a point in the sequence.
+//
+// Versions records the schema version of each collection's records, so a later
+// build can tell what it is reading and migrate. A collection absent from the
+// map is version 0, which is what every snapshot written before versioning
+// existed implies.
 type snapshotFile struct {
 	Seq         uint64                                `json:"seq"`
 	TS          int64                                 `json:"ts"`
 	Counters    map[string]uint64                     `json:"counters,omitempty"`
+	Versions    map[string]int                        `json:"versions,omitempty"`
 	Collections map[string]map[string]json.RawMessage `json:"collections"`
 }
 

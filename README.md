@@ -4,8 +4,8 @@ An embedded store for data that must not be lost. Everything lives in memory;
 every commit is appended to a write-ahead log and fsynced before it is
 acknowledged.
 
-Version 2 is a rewrite. If you are looking for the v1 key-value store, see
-[Relationship to v1](#relationship-to-v1) at the bottom.
+`v1.0.0` was a rewrite of the original key-value store; if you are coming from
+`v0.x`, see [Relationship to v0.x](#relationship-to-v0x) at the bottom.
 
 ---
 
@@ -22,40 +22,115 @@ Requires Go 1.25 or newer, as declared in `go.mod`. The language floor is 1.23
 
 ## Usage
 
-```go
-db := datastore.New(datastore.Options{Dir: "data/main"})
-
-orders := datastore.Register[*Order](db, "orders")
-byCustomer := datastore.AddIndex(orders, "customer",
-    func(o *Order) []string { return []string{o.CustomerID} })
-byNumber := datastore.AddUnique(orders, "num",
-    func(o *Order) string { return o.Num })
-byDate := datastore.AddSorted(orders, "date",
-    func(o *Order) int64 { return o.CreatedAt.Unix() })
-
-if err := db.Open(); err != nil {
-    return err
-}
-defer db.Close()
-```
-
-Records are any type with a `Key() string` method:
+The whole API, in one program:
 
 ```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "strconv"
+    "time"
+
+    "github.com/keshon/datastore"
+)
+
+// A record is an ordinary struct. The only requirement is a Key() method
+// returning something unique and stable: it is what addresses the record in the
+// log, so it must not change during the record's life.
 type Order struct {
-    ID         uint64
-    Num        string
-    CustomerID string
-    CreatedAt  time.Time
+    ID         uint64    `json:"id"`
+    Num        string    `json:"num"`
+    CustomerID string    `json:"customer_id"`
+    Total      int       `json:"total"`
+    CreatedAt  time.Time `json:"created_at"`
 }
 
 func (o *Order) Key() string { return strconv.FormatUint(o.ID, 10) }
+
+func main() {
+    // 1. Describe the database. This touches no disk at all.
+    db := datastore.New(datastore.Options{
+        Dir:      "data/main", // the directory this database owns
+        MaxBytes: 64 << 20,    // warn once the dataset outgrows 64 MiB of RAM
+    })
+
+    // 2. Declare the collections and indexes BEFORE opening — replaying the log
+    //    has to know where records belong and which indexes to rebuild. Calling
+    //    any of these after Open panics rather than quietly losing data.
+    orders := datastore.Register[*Order](db, "orders", datastore.Version(1))
+
+    // Three kinds of index. All are rebuilt at Open, never stored on disk.
+    byCustomer := datastore.AddIndex(orders, "customer", // many records per term
+        func(o *Order) []string { return []string{o.CustomerID} })
+    byNumber := datastore.AddUnique(orders, "num", // at most one record per term
+        func(o *Order) string { return o.Num })
+    byDate := datastore.AddSorted(orders, "date", // ordered by an int64
+        func(o *Order) int64 { return o.CreatedAt.Unix() })
+
+    // 3. Open: take the directory lock, load the newest snapshot, replay the log
+    //    on top of it, run any migrations, rebuild the indexes.
+    if err := db.Open(); err != nil {
+        log.Fatal(err) // ErrLocked if another process already owns this directory
+    }
+    defer db.Close() // stops workers, compacts, releases the lock
+
+    // Open succeeding does not prove nothing was lost: a damaged log tail is
+    // discarded so the store can start at all. Ask, and complain if it happened.
+    if rep := db.Recovery(); rep.LostData() {
+        log.Printf("datastore lost committed work: %s", rep.TruncatedReason)
+    }
+
+    // 4. Write inside a transaction: one log frame, one fsync, all-or-nothing.
+    //    Returning an error rolls everything back and writes nothing.
+    err := db.Update(func(tx *datastore.Tx) error {
+        o := datastore.In(tx, orders) // scope the collection to this transaction
+
+        // Counters are reserved here and only become permanent on commit.
+        period, seq := tx.NextInPeriod("order", time.Now(), "0601") // "2607", 1
+
+        return o.Put(&Order{
+            ID:         tx.NextID("order"),
+            Num:        fmt.Sprintf("%s/%d", period, seq), // "2607/1"
+            CustomerID: "cust-7",
+            Total:      4200,
+            CreatedAt:  time.Now(),
+        })
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 5. Read. No transaction needed, and everything you get back is a fresh
+    //    copy — changing it affects nothing until you Put it back.
+    if o, ok := orders.Get("1"); ok {
+        fmt.Println("order 1 belongs to", o.CustomerID)
+    }
+
+    // Query through the indexes.
+    fmt.Println("orders for cust-7:", len(byCustomer.Get("cust-7")))
+    if o, ok := byNumber.Get("2607/1"); ok {
+        fmt.Println("found by number:", o.ID)
+    }
+    for _, o := range byDate.Desc(10, 0) { // the ten most recent
+        fmt.Println(o.Num, o.Total)
+    }
+
+    // Or just loop: at these volumes a linear scan is microseconds.
+    total := 0
+    for o := range orders.All() {
+        total += o.Total
+    }
+    fmt.Printf("%d orders, %d total\n", orders.Len(), total)
+}
 ```
 
-Opening is two-phase: replaying the log needs to know the collections and
-indexes before it can rebuild them, so `Register` and `Add*Index` must all
-happen before `Open`. Calling them afterwards panics rather than silently
-losing data.
+For a single write there is a shorthand — `orders.Put(o)` and
+`orders.Delete(key)` each run as a one-operation transaction. Do not call them
+from *inside* `db.Update`: each one starts its own transaction, and there is only
+one writer. (Doing it anyway panics immediately and tells you to use
+`datastore.In(tx, orders)`.)
 
 ---
 
@@ -95,11 +170,91 @@ with an explanation.
 
 ---
 
+## Schema changes
+
+Adding a field needs nothing: JSON decoding fills it with the zero value.
+Migrations are for the changes decoding cannot guess — a renamed field, a
+changed unit, a struct split in two — where the old records are still valid JSON
+but no longer mean what the new code thinks.
+
+```go
+users := datastore.Register[*User](db, "users", datastore.Version(2))
+datastore.Migrate(users, 1, func(raw json.RawMessage) (json.RawMessage, error) {
+    // v1 stored "name"; v2 stores "full_name"
+    var m map[string]json.RawMessage
+    if err := json.Unmarshal(raw, &m); err != nil {
+        return nil, err
+    }
+    if v, ok := m["name"]; ok {
+        m["full_name"] = v
+        delete(m, "name")
+    }
+    return json.Marshal(m)
+})
+```
+
+A migration takes raw JSON and returns raw JSON, because the Go type it has to
+read no longer exists in this build. That is unpleasant to write and it is the
+honest signature; the alternative is a museum of old structs compiled in
+forever.
+
+At `Open`, records below the declared version are carried up one step at a time
+— snapshot rows and log frames alike — and the database is compacted before
+`Open` returns, so the log never holds a mix of versions and the work is not
+repeated on the next start. Opening data written by a *newer* build fails
+instead of guessing.
+
+## Knowing when something went wrong
+
+Recovery will discard a damaged log tail in order to open at all. That is the
+right trade, but it means a successful `Open` is not proof that nothing was
+lost. Ask:
+
+```go
+if rep := db.Recovery(); rep.LostData() {
+    log.Error().
+        Str("reason", rep.TruncatedReason).
+        Int64("at", rep.TruncatedAt).
+        Msg("datastore lost committed work")
+}
+```
+
+`Clean()` is the stricter question — nothing skipped, truncated, or migrated.
+
+`db.Verify()` rebuilds every index from the records and reports disagreements.
+The indexes are derived state maintained incrementally, and nothing else ever
+checks them against their source; run this in CI or behind an admin command.
+`dstest.Open` runs it automatically when a test finishes.
+
+Set `Options.MaxBytes` to the size the dataset is expected to stay under. It
+enforces nothing — it logs when you cross the threshold and reports `Bytes` and
+`Budget` in `Stats`, which turns "OOM one morning" into a line in a log months
+earlier. `Options.OnCommit` receives a summary of every commit for metrics.
+
+## Reading from a second process
+
+Only one process may *own* a directory. A second one can still read it:
+
+```go
+db := datastore.New(datastore.Options{Dir: dir})
+orders := datastore.Register[*Order](db, "orders")
+if err := db.OpenReader(); err != nil { ... }
+```
+
+`OpenReader` takes no lock and never writes — not the log header, not a
+compaction, not even the truncation of a damaged tail (damage is reported
+through `Recovery` instead of repaired, because the log belongs to whoever holds
+the lock). The view is a point in time; reopen to see later commits. Every write
+returns `ErrReadOnly`.
+
+That is what a CLI, an inspector or a backup job should use while the
+application keeps running.
+
 ## What it does not do
 
-No query language, no joins, no key range scans, no MVCC, no replication, no
-multi-process access, no automatic schema migration. Declare an index or write a
-Go loop — at these volumes a linear scan is measured in microseconds.
+No query language, no joins, no key range scans, no MVCC, no replication, and no
+multi-process *writing*. Declare an index or write a Go loop — at these volumes a
+linear scan is measured in microseconds.
 
 It assumes **the whole dataset fits comfortably in RAM**. That assumption is what
 justifies deleting most of what a database normally does. When it stops holding,
@@ -118,19 +273,24 @@ application rather than beside it.
 | Function | Description |
 |---|---|
 | `New(opts Options) *DB` | Prepares a database. Performs no I/O. |
-| `(*DB) Open() error` | Takes the directory lock, restores state, starts background work. |
+| `(*DB) Open() error` | Takes the directory lock, restores state, migrates, starts background work. |
+| `(*DB) OpenReader() error` | Opens read-only without the lock, for a second process. |
 | `(*DB) Close() error` | Stops workers, compacts, releases the lock. Safe to call twice. |
 | `(*DB) Update(fn func(*Tx) error) error` | Read-write transaction. Commits if `fn` returns nil. |
 | `(*DB) View(fn func(*Tx) error) error` | Read-only transaction; the read lock is held throughout. |
 | `(*DB) Compact() error` | Folds the log into a fresh snapshot and empties it. |
 | `(*DB) Backup(dst string) error` | Writes a self-contained copy into `dst`. |
 | `(*DB) Stats() Stats` | Point-in-time summary for an admin screen or health check. |
+| `(*DB) Recovery() RecoveryReport` | What the last `Open` found — and what it could not use. |
+| `(*DB) Verify() error` | Rebuilds every index from the records and reports disagreements. |
+| `(*DB) ReadOnly() bool` / `(*DB) Dir() string` | How it was opened, and where. |
 
 ### Collections and transactions
 
 | Function | Description |
 |---|---|
-| `Register[T Entity](db, name) *Collection[T]` | Declares a collection. Before `Open`; panics after. |
+| `Register[T Entity](db, name, opts...) *Collection[T]` | Declares a collection. Before `Open`; panics after. Pass `Version(n)` to version its schema. |
+| `Migrate[T](c, from, fn)` | Declares the step carrying records from version `from` to `from+1`. |
 | `(*Collection[T]) Get(key) (T, bool)` | A freshly decoded copy, never a shared pointer. |
 | `(*Collection[T]) Put(v T) error` | Single-operation transaction. |
 | `(*Collection[T]) Delete(key) error` | Single-operation transaction. Absent key is not an error. |
@@ -139,7 +299,7 @@ application rather than beside it.
 | `In[T](tx, c) *TxCollection[T]` | Scopes a collection to a transaction. |
 | `(*TxCollection[T]) Get / Put / Delete` | Reads see this transaction's own uncommitted writes. |
 | `(*Tx) NextID(name string) uint64` | Monotonic counter, permanent only on commit. |
-| `(*Tx) NextOrderNum(t time.Time) string` | `NextID` formatted as `YYMM/n`, restarting each month. |
+| `(*Tx) NextInPeriod(name, t, layout) (string, uint64)` | A counter that restarts each period — `"0601"` monthly, `"2006"` yearly. |
 
 ### Indexes
 
@@ -164,6 +324,9 @@ All three must be declared before `Open`.
 | `Logger` | no-op | `*zerolog.Logger` receiving recovery and compaction events. |
 | `Clock` | `time.Now` | Supplies commit timestamps. |
 | `WriteTimeout` | `30s` | How long `Update` waits for the writer slot before panicking. |
+| `MaxBytes` | `0` (off) | Size the dataset is expected to stay under. Warns; enforces nothing. |
+| `WarnAtPercent` | `80` | Fraction of `MaxBytes` that triggers the warning. |
+| `OnCommit` | none | Called with a `CommitStats` after each commit, for metrics. |
 
 ### Errors
 
@@ -173,8 +336,7 @@ All three must be declared before `Open`.
 | `ErrAlreadyOpen` | `Open` called twice. |
 | `ErrLocked` | Another process holds the directory lock. |
 | `ErrDuplicateKey` | Unique index violation. Surfaces from `Update`, not from `Put`. |
-| `ErrNotFound` | Missing key where one was required. |
-| `ErrReadOnly` | A write was attempted inside `View`. |
+| `ErrReadOnly` | A write was attempted inside `View`, or against an `OpenReader` database. |
 | `ErrTxDone` | Transaction used after it finished. |
 | `ErrEmptyKey` | `Key()` returned `""`. Keys address records in the log, so an empty one is unrecoverable rather than merely odd. |
 | `ErrCorruptFrame` | A log frame failed its checksum or length check. |
@@ -283,19 +445,22 @@ extra steps.
 
 ---
 
-## Relationship to v1
+## Relationship to v0.x
 
-This is a rewrite that keeps v1's good idea — atomic rename plus fsync — and
-adds the log, transactions, typed collections and indexes. The v1 API
+`v1.0.0` was a rewrite that keeps v0's good idea — atomic rename plus fsync —
+and adds the log, transactions, typed collections and indexes. The old API
 (`New(ctx, path, opts...)`, `Set`/`Get`/`Delete` over a single JSON file) is
-gone; there is no compatibility shim and no automatic conversion. To migrate,
-read the old file and write the values into a registered collection.
+gone; there is no compatibility shim and no automatic conversion. To move data
+across, read the old file and write the values into a registered collection.
 
-Two v1 behaviours are deliberately not carried over: it installed a process-wide
+Two v0 behaviours are deliberately not carried over: it installed a process-wide
 signal handler and called `os.Exit` from library code, and its file locking
 compiled on neither platform (the Unix build referenced a field that did not
 exist; the Windows build returned an error unconditionally, so the default
 configuration always failed to open).
+
+Note that this is a different thing from a *schema* migration, which the store
+does support — see [Schema changes](#schema-changes).
 
 ---
 

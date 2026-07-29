@@ -23,6 +23,11 @@ type anyCollection interface {
 	dump() map[string]json.RawMessage
 	clear()
 	count() int
+	bytes() int
+	schemaVersion() int
+	checkVersion(onDisk int) error
+	migrateRaw(from int, raw json.RawMessage) (json.RawMessage, error)
+	verify() []string
 }
 
 // Collection is a typed set of records.
@@ -37,6 +42,11 @@ type Collection[T Entity] struct {
 	name string
 	data map[string]json.RawMessage
 
+	// version is the schema version this build writes; migrations carries each
+	// step from an older on-disk version up to it. See migrate.go.
+	version    int
+	migrations map[int]MigrateFunc
+
 	multi  []*Index[T]
 	unique []*UniqueIndex[T]
 	sorted []*SortedIndex[T]
@@ -47,7 +57,7 @@ type Collection[T Entity] struct {
 //
 // Panics on a duplicate name or after Open — both are programming errors that
 // would otherwise surface much later as missing data.
-func Register[T Entity](db *DB, name string) *Collection[T] {
+func Register[T Entity](db *DB, name string, opts ...CollectionOption) *Collection[T] {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -58,7 +68,17 @@ func Register[T Entity](db *DB, name string) *Collection[T] {
 		panic("datastore: collection " + name + " registered twice")
 	}
 
-	c := &Collection[T]{db: db, name: name, data: make(map[string]json.RawMessage)}
+	var cfg collectionConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	c := &Collection[T]{
+		db:      db,
+		name:    name,
+		data:    make(map[string]json.RawMessage),
+		version: cfg.version,
+	}
 	db.colls[name] = c
 	db.order = append(db.order, name)
 	return c
@@ -201,6 +221,53 @@ func (c *Collection[T]) clear() {
 	for _, i := range c.sorted {
 		i.clear()
 	}
+}
+
+// bytes reports the encoded size of the records held, for the memory budget.
+// Keys are counted too; the overhead of the maps themselves is not, so this is
+// a floor rather than a true heap measurement.
+func (c *Collection[T]) bytes() int {
+	total := 0
+	for k, v := range c.data {
+		total += len(k) + len(v)
+	}
+	return total
+}
+
+// verify recomputes what this collection should look like and reports every
+// disagreement it finds, in the form of human-readable problems.
+//
+// It exists because the indexes are derived state maintained incrementally: if
+// a bug ever let them drift from the records, nothing else would notice. Here
+// the records are the source of truth and the indexes are rebuilt from scratch
+// and compared.
+func (c *Collection[T]) verify() []string {
+	var problems []string
+
+	fresh := make(map[string]T, len(c.data))
+	for key, raw := range c.data {
+		v, err := c.decode(raw)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s/%s: undecodable: %v", c.name, key, err))
+			continue
+		}
+		if got := v.Key(); got != key {
+			problems = append(problems, fmt.Sprintf(
+				"%s/%s: record reports key %q; it is stored under a key it does not own", c.name, key, got))
+		}
+		fresh[key] = v
+	}
+
+	for _, i := range c.multi {
+		problems = append(problems, i.verify(fresh)...)
+	}
+	for _, i := range c.unique {
+		problems = append(problems, i.verify(fresh)...)
+	}
+	for _, i := range c.sorted {
+		problems = append(problems, i.verify(fresh)...)
+	}
+	return problems
 }
 
 func (c *Collection[T]) dump() map[string]json.RawMessage {

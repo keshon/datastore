@@ -38,18 +38,23 @@ type Tx struct {
 // readers are never blocked by a transaction's body or by its fsync — only by
 // the brief moment where an already-durable commit is applied to memory.
 //
-// Do not call Update from inside fn. There is no way to detect that reliably in
-// Go, so instead of hanging forever the writer slot times out and panics with
-// an explanation.
+// Do not call Update from inside fn — including indirectly, through the
+// convenience methods Collection.Put and Collection.Delete, which are each a
+// transaction of their own. Doing so is caught and panics immediately with an
+// explanation; use In(tx, c) to write to a collection from inside a transaction.
 func (db *DB) Update(fn func(*Tx) error) error {
 	db.acquireWriter()
 	defer db.releaseWriter()
 
 	db.mu.RLock()
 	ready := db.opened && !db.closed
+	readOnly := db.readOnly
 	db.mu.RUnlock()
 	if !ready {
 		return ErrNotOpen
+	}
+	if readOnly {
+		return ErrReadOnly
 	}
 
 	tx := &Tx{
@@ -81,16 +86,30 @@ func (db *DB) View(fn func(*Tx) error) error {
 	return fn(tx)
 }
 
+const reentrantMsg = "datastore: Update called from inside another Update on the same " +
+	"goroutine — it can never proceed. Write through In(tx, collection) instead of " +
+	"Collection.Put/Delete (each of those is its own transaction)."
+
 func (db *DB) acquireWriter() {
 	select {
 	case db.writeCh <- struct{}{}:
+		db.writerGoid.Store(goid())
 		return
 	default:
 	}
+
+	// The slot is taken. If this very goroutine holds it, waiting is futile: the
+	// only outcome is the timeout panic, WriteTimeout from now. Say so at once,
+	// while the stack still shows who did it.
+	if id := goid(); id != 0 && db.writerGoid.Load() == id {
+		panic(reentrantMsg)
+	}
+
 	timer := time.NewTimer(db.opts.WriteTimeout)
 	defer timer.Stop()
 	select {
 	case db.writeCh <- struct{}{}:
+		db.writerGoid.Store(goid())
 	case <-timer.C:
 		panic(fmt.Sprintf(
 			"datastore: no writer slot after %s. The usual cause is calling Update "+
@@ -99,7 +118,12 @@ func (db *DB) acquireWriter() {
 	}
 }
 
-func (db *DB) releaseWriter() { <-db.writeCh }
+// releaseWriter clears the owner before freeing the slot, so the next holder
+// cannot have its id overwritten by this one.
+func (db *DB) releaseWriter() {
+	db.writerGoid.Store(0)
+	<-db.writeCh
+}
 
 // commit validates, makes the change durable, and only then applies it.
 //
@@ -160,9 +184,11 @@ func (db *DB) commit(tx *Tx) error {
 	}
 
 	sync := db.opts.Sync == SyncAlways
+	started := time.Now()
 	if err := db.wal.append(frame, sync); err != nil {
 		return err
 	}
+	durable := time.Since(started)
 
 	// The frame is now durable but not yet applied. This gap is the most
 	// dangerous few microseconds in the package: anything that snapshots the
@@ -187,7 +213,20 @@ func (db *DB) commit(tx *Tx) error {
 		db.unsynced = true
 	}
 	needCompact := db.wal.size >= db.opts.CompactAfterBytes
+	walBytes := db.wal.size
+	db.checkBudgetLocked()
 	db.mu.Unlock()
+
+	if db.opts.OnCommit != nil {
+		db.opts.OnCommit(CommitStats{
+			Seq:        frame.Seq,
+			Ops:        len(frame.Ops),
+			FrameBytes: frame.encodedSize,
+			Duration:   durable,
+			Synced:     sync,
+			WALBytes:   walBytes,
+		})
+	}
 
 	if needCompact {
 		// compactExclusive, not Compact: this goroutine already holds the
@@ -215,14 +254,15 @@ func (tx *Tx) NextID(name string) uint64 {
 	return cur + 1
 }
 
-// NextOrderNum returns a human-facing order number: the two-digit year and
-// month, a slash, and a counter that restarts each month — "2607/14".
+// NextInPeriod allocates from a counter that restarts each period, and returns
+// both the period label and the value — "2607", 14.
 //
-// The shape is inherited from the legacy shop and is printed on invoices and
-// quoted in support threads, so it is frozen. See docs/conventions.md.
-func (tx *Tx) NextOrderNum(t time.Time) string {
-	bucket := t.Format("0601")
-	return fmt.Sprintf("%s/%d", bucket, tx.NextID("order:"+bucket))
+// It is the generic form of a human-facing document number: format the two as
+// you like ("2607/14", "INV-2607-014"). The period comes from a time layout, so
+// "0601" is monthly, "2006" yearly, "20060102" daily.
+func (tx *Tx) NextInPeriod(name string, t time.Time, layout string) (string, uint64) {
+	period := t.Format(layout)
+	return period, tx.NextID(name + ":" + period)
 }
 
 func (tx *Tx) withRead(f func()) {

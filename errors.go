@@ -19,10 +19,8 @@ var (
 	// transaction may legitimately swap a unique value between two records.
 	ErrDuplicateKey = errors.New("datastore: unique index violation")
 
-	// ErrNotFound reports a missing key where one was required.
-	ErrNotFound = errors.New("datastore: key not found")
-
-	// ErrReadOnly is returned when a write is attempted inside View.
+	// ErrReadOnly is returned when a write is attempted inside View, or against a
+	// database opened with OpenReader.
 	ErrReadOnly = errors.New("datastore: transaction is read-only")
 
 	// ErrTxDone is returned when a transaction is used after it finished.
