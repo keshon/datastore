@@ -9,4 +9,4 @@ package datastore
 // which os.Rename uses, is atomic on NTFS with respect to crash recovery, so
 // the rename either happened or it did not. The durability of the snapshot's
 // *contents* comes from the Sync on the temporary file, which does work here.
-func syncDir(string) error { return nil }
+func syncDir(dir string) error { return nil }

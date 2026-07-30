@@ -1,5 +1,10 @@
 package datastore
 
+import (
+	"maps"
+	"slices"
+)
+
 // RecoveryReport describes what Open found on disk and, more importantly, what
 // it could not use.
 //
@@ -56,9 +61,12 @@ func (r RecoveryReport) LostData() bool {
 }
 
 // Recovery returns what the last Open found. The zero value is returned before
-// Open.
+// Open. The report is the caller's own copy.
 func (db *DB) Recovery() RecoveryReport {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.recovery
+	rep := db.recovery
+	rep.Migrated = maps.Clone(rep.Migrated)
+	rep.SnapshotsSkipped = slices.Clone(rep.SnapshotsSkipped)
+	return rep
 }

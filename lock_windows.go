@@ -3,6 +3,7 @@
 package datastore
 
 import (
+	"errors"
 	"os"
 
 	"golang.org/x/sys/windows"
@@ -37,4 +38,10 @@ func lockFile(f *os.File) error {
 func unlockFile(f *os.File) error {
 	ol := &windows.Overlapped{OffsetHigh: lockOffsetHigh}
 	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, lockBytes, 0, ol)
+}
+
+// lockContended reports whether the lock failed because another process holds
+// it, as opposed to locking itself being broken.
+func lockContended(err error) bool {
+	return errors.Is(err, windows.ERROR_LOCK_VIOLATION)
 }

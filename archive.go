@@ -75,14 +75,22 @@ func (db *DB) archiveLogLocked(seq uint64) error {
 	}
 	dst := filepath.Join(db.opts.Dir, archiveName(seq))
 	if err := os.Rename(filepath.Join(db.opts.Dir, walName), dst); err != nil && !os.IsNotExist(err) {
-		// Reopen so the database stays usable even though archiving failed.
-		if w, oerr := openWAL(db.opts.Dir); oerr == nil {
-			db.wal = w
+		// Reopen so the database stays usable even though archiving failed. If
+		// even that fails, the log is gone from under an open database: latch
+		// the failure so writes are refused instead of silently impossible.
+		w, oerr := openWAL(db.opts.Dir)
+		if oerr != nil {
+			db.failed = fmt.Errorf("reopen log after failed archiving: %w", oerr)
+			db.log.Error().Err(db.failed).Msg("datastore_failed: refusing further writes")
+			return fmt.Errorf("datastore: archive log: %w (and reopening failed: %v)", err, oerr)
 		}
+		db.wal = w
 		return fmt.Errorf("datastore: archive log: %w", err)
 	}
 	w, err := openWAL(db.opts.Dir)
 	if err != nil {
+		db.failed = fmt.Errorf("open fresh log after archiving: %w", err)
+		db.log.Error().Err(db.failed).Msg("datastore_failed: refusing further writes")
 		return err
 	}
 	db.wal = w

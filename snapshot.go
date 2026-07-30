@@ -101,6 +101,14 @@ func writeSnapshot(dir string, snap *snapshotFile) error {
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath) // no-op once the rename succeeds
 
+	// CreateTemp makes the file 0o600, but the snapshot holds the same data as
+	// the 0o644 log — a backup job running as another user should not find the
+	// full state stricter than the tail of it.
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return fmt.Errorf("datastore: chmod temp snapshot: %w", err)
+	}
+
 	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
 		return fmt.Errorf("datastore: write temp snapshot: %w", err)

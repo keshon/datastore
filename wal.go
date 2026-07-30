@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const (
@@ -59,9 +61,9 @@ type walFrame struct {
 	// would have been before annotations existed.
 	Meta map[string]string `json:"meta,omitempty"`
 
-	// encodedSize is the on-disk size of this frame, filled in by append. It is
-	// reported through CommitStats and is not part of the payload.
-	encodedSize int `json:"-"`
+	// encodedSize is the on-disk size of this frame, filled in by encodeFrame.
+	// It is reported through CommitStats and is not part of the payload.
+	encodedSize int
 }
 
 // wal is the append-only log.
@@ -71,6 +73,10 @@ type walFrame struct {
 // able to read the log with `less` when something has gone wrong matters a
 // great deal. Do not "optimise" this.
 type wal struct {
+	// mu guards f and size. The writer slot already serialises appends, but the
+	// interval-sync goroutine and Stats read this struct concurrently with them,
+	// and Close can nil out f under either.
+	mu   sync.Mutex
 	f    *os.File
 	path string
 	size int64
@@ -97,7 +103,22 @@ func openWAL(dir string) (*wal, error) {
 	w := &wal{f: f, path: path, size: info.Size()}
 
 	if w.size < int64(walHeaderSize) {
-		// New or truncated-to-nothing: (re)write the header.
+		// An empty file is a new log. A short one is only ours if what is there
+		// is a prefix of our own header — a crash while the header was being
+		// written. Anything else is somebody else's file, and rewriting the
+		// header would begin with Truncate(0): the magic check exists precisely
+		// so a wrong path fails loudly instead of being destroyed.
+		if w.size > 0 {
+			prefix := make([]byte, w.size)
+			if _, err := f.ReadAt(prefix, 0); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("datastore: read wal header: %w", err)
+			}
+			if !bytes.Equal(prefix, headerBytes()[:w.size]) {
+				f.Close()
+				return nil, fmt.Errorf("%w: %s", ErrInvalidLog, path)
+			}
+		}
 		if err := w.writeHeader(); err != nil {
 			f.Close()
 			return nil, err
@@ -112,11 +133,11 @@ func openWAL(dir string) (*wal, error) {
 	}
 	if string(header[:len(walMagic)]) != walMagic {
 		f.Close()
-		return nil, fmt.Errorf("datastore: %s is not a datastore log", path)
+		return nil, fmt.Errorf("%w: %s", ErrInvalidLog, path)
 	}
 	if v := binary.LittleEndian.Uint16(header[len(walMagic):]); v != walVersion {
 		f.Close()
-		return nil, fmt.Errorf("datastore: log version %d, this build understands %d", v, walVersion)
+		return nil, fmt.Errorf("%w: log version %d, this build understands %d", ErrLogVersion, v, walVersion)
 	}
 	return w, nil
 }
@@ -151,19 +172,26 @@ func openWALRead(dir string) (*wal, error) {
 	}
 	if string(header[:len(walMagic)]) != walMagic {
 		f.Close()
-		return nil, fmt.Errorf("datastore: %s is not a datastore log", path)
+		return nil, fmt.Errorf("%w: %s", ErrInvalidLog, path)
 	}
 	if v := binary.LittleEndian.Uint16(header[len(walMagic):]); v != walVersion {
 		f.Close()
-		return nil, fmt.Errorf("datastore: log version %d, this build understands %d", v, walVersion)
+		return nil, fmt.Errorf("%w: log version %d, this build understands %d", ErrLogVersion, v, walVersion)
 	}
 	return w, nil
 }
 
-func (w *wal) writeHeader() error {
+// headerBytes is the log header this build writes: magic plus version.
+func headerBytes() []byte {
 	header := make([]byte, walHeaderSize)
 	copy(header, walMagic)
 	binary.LittleEndian.PutUint16(header[len(walMagic):], walVersion)
+	return header
+}
+
+// writeHeader assumes the caller holds w.mu or has not yet shared the wal.
+func (w *wal) writeHeader() error {
+	header := headerBytes()
 	if err := w.f.Truncate(0); err != nil {
 		return fmt.Errorf("datastore: truncate wal: %w", err)
 	}
@@ -177,18 +205,19 @@ func (w *wal) writeHeader() error {
 	return nil
 }
 
-// append writes one frame and, when sync is set, waits for it to reach disk.
+// encodeFrame turns a frame into its on-disk bytes: length, checksum, payload.
 //
-// The frame is written with a single Write so the kernel sees it as one
-// extent; a torn tail is still possible on power loss, which is exactly what
-// the length prefix and checksum are there to detect.
-func (w *wal) append(fr *walFrame, sync bool) error {
+// It is separate from append so that everything that can fail without touching
+// the disk — encoding, the size limit — fails before a single byte is written.
+// An error from encodeFrame leaves the log untouched; an error from append does
+// not, which is why only the latter poisons the database (see DB.commit).
+func encodeFrame(fr *walFrame) ([]byte, error) {
 	payload, err := json.Marshal(fr)
 	if err != nil {
-		return fmt.Errorf("datastore: encode frame: %w", err)
+		return nil, fmt.Errorf("datastore: encode frame: %w", err)
 	}
 	if len(payload) > maxFrameSize {
-		return fmt.Errorf("datastore: frame of %d bytes exceeds the %d limit", len(payload), maxFrameSize)
+		return nil, fmt.Errorf("datastore: frame of %d bytes exceeds the %d limit", len(payload), maxFrameSize)
 	}
 
 	buf := make([]byte, frameHeaderSize+len(payload))
@@ -196,11 +225,28 @@ func (w *wal) append(fr *walFrame, sync bool) error {
 	binary.LittleEndian.PutUint32(buf[4:], crc32.Checksum(payload, crcTable))
 	copy(buf[frameHeaderSize:], payload)
 	fr.encodedSize = len(buf)
+	return buf, nil
+}
 
+// append writes one encoded frame and, when sync is set, waits for it to reach
+// disk.
+//
+// The frame is written with a single Write so the kernel sees it as one
+// extent; a torn tail is still possible on power loss, which is exactly what
+// the length prefix and checksum are there to detect. Any error from here means
+// the log may hold a partial frame — the caller must stop accepting writes.
+func (w *wal) append(buf []byte, sync bool) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.f == nil {
+		return fmt.Errorf("datastore: append to a closed log")
+	}
 	n, err := w.f.WriteAt(buf, w.size)
 	if err != nil {
-		// A short write leaves a partial frame. That is safe: the next replay
-		// detects it and truncates. Do not try to "repair" it here.
+		// A short write leaves a partial frame. That is safe for the data
+		// already on disk: the next replay detects it and truncates. Do not try
+		// to "repair" it here.
 		w.size += int64(n)
 		return fmt.Errorf("datastore: append frame: %w", err)
 	}
@@ -214,16 +260,35 @@ func (w *wal) append(fr *walFrame, sync bool) error {
 	return nil
 }
 
+// sizeNow reports the current size of the log file.
+func (w *wal) sizeNow() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.size
+}
+
 // scanFrames reads every intact frame of a log file in order, for History.
 //
 // It deliberately does not share code with replay. Replay is the crash-tested
 // recovery path: it truncates damage, tracks where and why it stopped, and its
-// behaviour is pinned by the crash suite. Scanning is read-only and stops
-// quietly at the first damaged frame, since a torn tail on the newest segment
-// is normal and simply means history ends there. Keeping them apart means a
-// change to history reading can never alter recovery; the cost is the fifteen
-// lines of framing below, which the constants keep honest.
-func scanFrames(path string, fn func(*walFrame) error) error {
+// behaviour is pinned by the crash suite. Keeping them apart means a change to
+// history reading can never alter recovery; the cost is the framing below,
+// which the constants keep honest.
+//
+// strict decides what a damaged frame means. The live log may legitimately end
+// in a torn frame — a crash mid-append — so there damage quietly ends the scan.
+// An archive was written complete and then closed; a frame that no longer reads
+// back is corruption, and strict mode surfaces it as ErrCorruptFrame instead of
+// silently presenting a shortened history as the whole truth. Real I/O errors
+// are returned in both modes.
+func scanFrames(path string, strict bool, fn func(*walFrame) error) error {
+	damaged := func(reason string) error {
+		if !strict {
+			return nil
+		}
+		return fmt.Errorf("%w: %s: %s", ErrCorruptFrame, filepath.Base(path), reason)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -241,23 +306,32 @@ func scanFrames(path string, fn func(*walFrame) error) error {
 
 	for {
 		if _, err := io.ReadFull(r, head); err != nil {
-			return nil // clean end, or a torn header: history stops here
+			if errors.Is(err, io.EOF) {
+				return nil // clean end
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return damaged("torn frame header")
+			}
+			return fmt.Errorf("datastore: read %s: %w", filepath.Base(path), err)
 		}
 		length := binary.LittleEndian.Uint32(head[0:])
 		want := binary.LittleEndian.Uint32(head[4:])
 		if length == 0 || length > maxFrameSize {
-			return nil
+			return damaged(fmt.Sprintf("implausible frame length %d", length))
 		}
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(r, payload); err != nil {
-			return nil
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return damaged("torn frame payload")
+			}
+			return fmt.Errorf("datastore: read %s: %w", filepath.Base(path), err)
 		}
 		if crc32.Checksum(payload, crcTable) != want {
-			return nil
+			return damaged("checksum mismatch")
 		}
 		var fr walFrame
 		if err := json.Unmarshal(payload, &fr); err != nil {
-			return nil
+			return damaged("undecodable frame payload")
 		}
 		if err := fn(&fr); err != nil {
 			return err
@@ -281,6 +355,9 @@ type replayResult struct {
 // a sequence of decisions, and once one is unreadable the ones after it cannot
 // be trusted to apply to the state we think we have.
 func (w *wal) replay(minSeq uint64, fn func(*walFrame) error) (replayResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	var res replayResult
 
 	if w.f == nil {
@@ -362,10 +439,14 @@ func (w *wal) replay(minSeq uint64, fn func(*walFrame) error) (replayResult, err
 // reset empties the log back to its header. Called after a snapshot has been
 // durably written, never before.
 func (w *wal) reset() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.writeHeader()
 }
 
 func (w *wal) sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.f == nil {
 		return nil
 	}
@@ -373,6 +454,8 @@ func (w *wal) sync() error {
 }
 
 func (w *wal) close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.f == nil {
 		return nil
 	}

@@ -79,11 +79,20 @@ func (i *Index[T]) clear() {
 	i.byKey = make(map[string][]string)
 }
 
-// Get returns every record carrying the term, in key order.
-func (i *Index[T]) Get(term string) []T {
+// Find returns every record carrying the term, in key order.
+func (i *Index[T]) Find(term string) []T {
 	i.coll.db.mu.RLock()
 	defer i.coll.db.mu.RUnlock()
+	return i.findLocked(term)
+}
 
+// Get returns every record carrying the term, in key order.
+//
+// Deprecated: renamed to Find. Get elsewhere in this package means "one record,
+// by its key or its unique term", and a multi-valued lookup is neither.
+func (i *Index[T]) Get(term string) []T { return i.Find(term) }
+
+func (i *Index[T]) findLocked(term string) []T {
 	set := i.byTerm[term]
 	if len(set) == 0 {
 		return nil
@@ -114,7 +123,10 @@ func (i *Index[T]) Count(term string) int {
 func (i *Index[T]) Terms() []string {
 	i.coll.db.mu.RLock()
 	defer i.coll.db.mu.RUnlock()
+	return i.termsLocked()
+}
 
+func (i *Index[T]) termsLocked() []string {
 	out := make([]string, 0, len(i.byTerm))
 	for t := range i.byTerm {
 		out = append(out, t)
@@ -183,7 +195,10 @@ func (u *UniqueIndex[T]) clear() {
 func (u *UniqueIndex[T]) Get(term string) (T, bool) {
 	u.coll.db.mu.RLock()
 	defer u.coll.db.mu.RUnlock()
+	return u.getLocked(term)
+}
 
+func (u *UniqueIndex[T]) getLocked(term string) (T, bool) {
 	key, ok := u.byTerm[term]
 	if !ok {
 		var zero T
@@ -277,7 +292,10 @@ func (s *SortedIndex[T]) materialise(entries []sortedEntry) []T {
 func (s *SortedIndex[T]) Range(lo, hi int64) []T {
 	s.coll.db.mu.RLock()
 	defer s.coll.db.mu.RUnlock()
+	return s.rangeLocked(lo, hi)
+}
 
+func (s *SortedIndex[T]) rangeLocked(lo, hi int64) []T {
 	if lo > hi {
 		return nil
 	}

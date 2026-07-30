@@ -1,7 +1,9 @@
 package datastore
 
 import (
+	"bytes"
 	"encoding/json"
+	"maps"
 	"sync"
 	"time"
 )
@@ -28,10 +30,12 @@ type Event struct {
 	Key        string
 	Delete     bool
 
-	// Value is the record as written, still encoded. Nil for a delete.
+	// Value is the record as written, still encoded. Nil for a delete. The
+	// bytes are the subscriber's own copy — keeping or mutating them is fine.
 	Value json.RawMessage
 
 	// Meta is the annotations the committing transaction attached (Tx.Note).
+	// The map is the subscriber's own copy.
 	Meta map[string]string
 
 	// Dropped counts events discarded between the previous delivered event and
@@ -185,31 +189,27 @@ func (db *DB) dispatch(fr *walFrame) {
 
 	ts := time.Unix(fr.TS, 0)
 	for _, op := range fr.Ops {
-		var delivered bool
+		// Each subscriber gets its own copy of the value and the annotations.
+		// The frame's bytes are also the collection's stored record: handing
+		// them out live would let a subscriber mutate the database in place,
+		// breaking the package's central promise that everything you get back
+		// is yours.
 		for _, sub := range subs {
-			if sub.wants(op.Coll) {
-				delivered = true
-				break
+			if !sub.wants(op.Coll) {
+				continue
 			}
-		}
-		if !delivered {
-			continue
-		}
-		ev := Event{
-			Seq:        fr.Seq,
-			Time:       ts,
-			Collection: op.Coll,
-			Key:        op.Key,
-			Delete:     op.Op == opDelete,
-			Meta:       fr.Meta,
-		}
-		if op.Op != opDelete {
-			ev.Value = op.Val
-		}
-		for _, sub := range subs {
-			if sub.wants(op.Coll) {
-				sub.offer(ev)
+			ev := Event{
+				Seq:        fr.Seq,
+				Time:       ts,
+				Collection: op.Coll,
+				Key:        op.Key,
+				Delete:     op.Op == opDelete,
+				Meta:       maps.Clone(fr.Meta),
 			}
+			if op.Op != opDelete {
+				ev.Value = bytes.Clone(op.Val)
+			}
+			sub.offer(ev)
 		}
 	}
 }

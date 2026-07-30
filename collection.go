@@ -111,7 +111,12 @@ func (c *Collection[T]) getLocked(key string) (T, bool) {
 	}
 	v, err := c.decode(raw)
 	if err != nil {
-		// Unreachable in practice: the value round-tripped through Put.
+		// Unreachable in practice: the value round-tripped through Put. If it
+		// happens anyway, a record silently missing from reads and index
+		// results is the worst way to find out — say so loudly. Verify reports
+		// the same record as undecodable.
+		c.db.log.Error().Err(err).Str("collection", c.name).Str("key", key).
+			Msg("record_undecodable: hidden from reads")
 		var zero T
 		return zero, false
 	}
@@ -306,7 +311,7 @@ func (c *Collection[T]) checkUnique(puts map[string]json.RawMessage, dels map[st
 			}
 			if other, clash := pending[term]; clash {
 				return fmt.Errorf("%w: %s.%s = %q on both %q and %q",
-					ErrDuplicateKey, c.name, idx.name, term, other, key)
+					ErrUniqueViolation, c.name, idx.name, term, other, key)
 			}
 			pending[term] = key
 
@@ -323,7 +328,7 @@ func (c *Collection[T]) checkUnique(puts map[string]json.RawMessage, dels map[st
 				continue
 			}
 			return fmt.Errorf("%w: %s.%s = %q already held by %q",
-				ErrDuplicateKey, c.name, idx.name, term, holder)
+				ErrUniqueViolation, c.name, idx.name, term, holder)
 		}
 	}
 	return nil

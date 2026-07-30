@@ -32,7 +32,13 @@ func acquireLock(dir string) (*dirLock, error) {
 
 	if err := lockFile(f); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("%w: %s (held by pid %s)", ErrLocked, path, readHolder(path))
+		if lockContended(err) {
+			return nil, fmt.Errorf("%w: %s (held by pid %s)", ErrLocked, path, readHolder(path))
+		}
+		// Not contention — locking itself failed (permissions, a filesystem
+		// that cannot lock). Report the real error instead of blaming a
+		// nonexistent other process.
+		return nil, fmt.Errorf("datastore: lock %s: %w", path, err)
 	}
 
 	// Record the holder for diagnostics only. Nothing reads this to make a

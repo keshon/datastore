@@ -35,10 +35,10 @@
 // # Layout on disk
 //
 //	dir/
-//	  LOCK                  exclusive, held for the lifetime of the process
-//	  snapshot-000412.json  full state as of sequence 412
-//	  wal.log               framed, append-only, everything after that
-//	  archive-000412.log    a past log segment, kept only if History is enabled
+//	  LOCK                        exclusive, held for the lifetime of the process
+//	  snapshot-000000000412.json  full state as of sequence 412
+//	  wal.log                     framed, append-only, everything after that
+//	  archive-000000000412.log    a past log segment, kept only if History is enabled
 //
 // Recovery loads the newest valid snapshot and replays the log on top of it,
 // stopping at the first frame that is short, fails its checksum, or arrives out
@@ -64,4 +64,17 @@
 //	err := db.Update(func(tx *datastore.Tx) error {
 //	    return datastore.In(tx, orders).Put(&Order{ID: tx.NextID("order")})
 //	})
+//
+// # Reading, and where from
+//
+// Outside a transaction, read straight off the collection or an index:
+// orders.Get(key), byCustomer.Find(term), orders.All(). Every value handed back
+// is a fresh copy.
+//
+// Inside Update or View, read through the transaction instead — In(tx, orders),
+// InIndex(tx, byCustomer), InUnique, InSorted. View holds the read lock for its
+// whole callback and the direct methods take that lock again; sync.RWMutex is
+// not reentrant, so a second acquisition deadlocks once a writer is queued. The
+// In* wrappers know the lock is already held. Reading through the transaction is
+// also what makes a read-then-write correct, since the pair is then atomic.
 package datastore

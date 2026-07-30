@@ -19,7 +19,7 @@ import (
 //
 // Declare the version and its migrations at Register time, before Open:
 //
-//	users := datastore.Register[*User](db, "users", datastore.Version(2))
+//	users := datastore.Register[*User](db, "users", datastore.SchemaVersion(2))
 //	datastore.Migrate(users, 1, func(raw json.RawMessage) (json.RawMessage, error) {
 //	    // v1 stored "name"; v2 stores "full_name"
 //	    var m map[string]json.RawMessage
@@ -50,14 +50,21 @@ type collectionConfig struct {
 	version int
 }
 
-// Version declares the schema version of the records this build writes.
+// SchemaVersion declares the schema version of the records this build writes.
 // Versions start at 1; an unversioned collection is version 0.
-func Version(v int) CollectionOption {
+func SchemaVersion(v int) CollectionOption {
 	if v < 0 {
 		panic("datastore: schema version must not be negative")
 	}
 	return func(c *collectionConfig) { c.version = v }
 }
+
+// Version is the old name of SchemaVersion.
+//
+// Deprecated: use SchemaVersion. At package scope, datastore.Version(2) read
+// like a statement about the library rather than about one collection's
+// records.
+func Version(v int) CollectionOption { return SchemaVersion(v) }
 
 // Migrate registers the transform that carries a record from version `from` to
 // version from+1. It must be called before Open, and every step between the

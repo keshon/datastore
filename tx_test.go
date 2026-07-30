@@ -249,7 +249,8 @@ func TestOrderNumberFormatAndMonthlyReset(t *testing.T) {
 	var nums []string
 	for _, when := range []time.Time{jul, jul, aug, jul} {
 		if err := f.db.Update(func(tx *Tx) error {
-			_, seq := tx.NextInPeriod("order", when, "0601"); n := fmt.Sprintf("%s/%d", when.Format("0601"), seq)
+			_, seq := tx.NextInPeriod("order", when, "0601")
+			n := fmt.Sprintf("%s/%d", when.Format("0601"), seq)
 			nums = append(nums, n)
 			return In(tx, f.orders).Put(mkOrder(n))
 		}); err != nil {

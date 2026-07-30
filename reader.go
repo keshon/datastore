@@ -28,7 +28,7 @@ func (db *DB) OpenReader() error {
 	}
 	if db.opts.Dir == "" {
 		db.mu.Unlock()
-		return fmt.Errorf("datastore: Options.Dir is required")
+		return errDirRequired
 	}
 	db.mu.Unlock()
 

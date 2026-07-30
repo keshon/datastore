@@ -42,7 +42,8 @@ type Options struct {
 	CompactAfterBytes int64
 
 	// CompactInterval compacts periodically regardless of size. Default 15m.
-	// A negative value disables the timer; zero means "use the default".
+	// CompactNever (or any negative value) disables the timer; zero means "use
+	// the default".
 	CompactInterval time.Duration
 
 	// KeepSnapshots is how many to retain. Minimum and default 2 — the
@@ -57,9 +58,10 @@ type Options struct {
 	Clock func() time.Time
 
 	// WriteTimeout bounds how long Update waits for the writer slot before
-	// panicking. Default 30s. It exists to turn a re-entrant Update — calling
-	// Update from inside Update — into a diagnosable panic instead of a
-	// process that hangs forever.
+	// giving up with ErrWriteTimeout. Default 30s. It exists so a transaction
+	// that never finishes turns into a diagnosable error instead of a process
+	// that hangs forever. (A re-entrant Update on the same goroutine does not
+	// even wait: it is detected and panics immediately.)
 	WriteTimeout time.Duration
 
 	// MaxBytes is the size this dataset is expected to stay under, in encoded
@@ -93,6 +95,11 @@ type Options struct {
 	HistorySegments int
 	HistoryFor      time.Duration
 }
+
+// CompactNever disables periodic compaction when assigned to
+// Options.CompactInterval. Compaction still runs when the log outgrows
+// CompactAfterBytes and once at Close.
+const CompactNever time.Duration = -1
 
 // CommitStats describes one committed transaction, for metrics.
 type CommitStats struct {
@@ -179,6 +186,12 @@ type DB struct {
 	closed   bool
 	readOnly bool // opened with OpenReader: every write path refuses
 
+	// failed, once set, refuses every further write with ErrFailed. It is set
+	// when a log write or sync fails: the log may then hold a torn frame, and
+	// anything appended after it would be silently discarded by the next
+	// replay while this process kept acknowledging commits. See ErrFailed.
+	failed error
+
 	stop        chan struct{}
 	wg          sync.WaitGroup
 	lastCompact time.Time
@@ -205,15 +218,36 @@ func New(opts Options) *DB {
 	}
 
 	return &DB{
-		opts:     opts,
-		log:      log,
-		writeCh:  make(chan struct{}, 1),
+		opts:           opts,
+		log:            log,
+		writeCh:        make(chan struct{}, 1),
 		colls:          make(map[string]anyCollection),
 		orphans:        make(map[string]map[string]json.RawMessage),
 		orphanVersions: make(map[string]int),
 		counters:       make(map[string]uint64),
 		stop:           make(chan struct{}),
 	}
+}
+
+// fail latches the first write failure. Every later write returns ErrFailed
+// wrapping this cause; reopening the database is the way back.
+func (db *DB) fail(cause error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.failed == nil {
+		db.failed = cause
+		db.log.Error().Err(cause).Msg("datastore_failed: refusing further writes")
+	}
+}
+
+// failedErr reports the latched failure, wrapped in ErrFailed, or nil.
+func (db *DB) failedErr() error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.failed == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrFailed, db.failed)
 }
 
 // Open takes the directory lock, restores state, and starts background work.
@@ -225,7 +259,7 @@ func (db *DB) Open() error {
 	}
 	if db.opts.Dir == "" {
 		db.mu.Unlock()
-		return fmt.Errorf("datastore: Options.Dir is required")
+		return errDirRequired
 	}
 	db.mu.Unlock()
 
@@ -458,6 +492,8 @@ func (db *DB) syncLoop() {
 		case <-db.stop:
 			return
 		case <-t.C:
+			// Clear the flag before syncing: a commit landing mid-sync sets it
+			// again and is picked up next tick, rather than being lost.
 			db.mu.Lock()
 			pending := db.unsynced
 			db.unsynced = false
@@ -465,7 +501,10 @@ func (db *DB) syncLoop() {
 			db.mu.Unlock()
 			if pending && w != nil {
 				if err := w.sync(); err != nil {
-					db.log.Error().Err(err).Msg("wal_sync_failed")
+					// A failed fsync means unknown durability from here on: the
+					// kernel may have dropped the dirty pages, and a later sync
+					// can report success without them. Stop accepting writes.
+					db.fail(fmt.Errorf("interval sync: %w", err))
 				}
 			}
 		}
@@ -549,8 +588,13 @@ func (db *DB) Compact() error {
 	if readOnly {
 		return ErrReadOnly
 	}
+	if err := db.failedErr(); err != nil {
+		return err
+	}
 
-	db.acquireWriter()
+	if err := db.acquireWriter(); err != nil {
+		return err
+	}
 	defer db.releaseWriter()
 	return db.compactExclusive()
 }
@@ -729,7 +773,6 @@ type Stats struct {
 
 func (db *DB) Stats() Stats {
 	db.mu.RLock()
-	defer db.mu.RUnlock()
 
 	s := Stats{
 		Seq:         db.seq,
@@ -748,10 +791,14 @@ func (db *DB) Stats() Stats {
 		s.Counters[k] = v
 	}
 	if db.wal != nil {
-		s.WALBytes = db.wal.size
+		s.WALBytes = db.wal.sizeNow()
 	}
 	s.Bytes = db.bytesLocked()
 	s.Budget = db.opts.MaxBytes
+	db.mu.RUnlock()
+
+	// Archive stats walk the directory. Filesystem work has no business under
+	// the state lock, where it would stall the writer's apply step.
 	if db.archivingEnabled() {
 		s.ArchiveSegments, s.ArchiveBytes = db.archiveStats()
 	}

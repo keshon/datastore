@@ -4,8 +4,44 @@ An embedded store for data that must not be lost. Everything lives in memory;
 every commit is appended to a write-ahead log and fsynced before it is
 acknowledged.
 
-`v1.0.0` was a rewrite of the original key-value store; if you are coming from
-`v0.x`, see [Relationship to v0.x](#relationship-to-v0x) at the bottom.
+```go
+db := datastore.New(datastore.Options{Dir: "data/main"})
+orders := datastore.Register[*Order](db, "orders")
+if err := db.Open(); err != nil {
+    return err
+}
+defer db.Close()
+
+// One frame, one fsync, all-or-nothing.
+err := db.Update(func(tx *datastore.Tx) error {
+    return datastore.In(tx, orders).Put(&Order{ID: tx.NextID("order")})
+})
+
+o, ok := orders.Get("1") // a fresh copy, no transaction needed
+```
+
+That is the whole shape of it: describe the database, declare the collections,
+open, write in transactions, read directly.
+
+---
+
+## Contents
+
+- [Installation](#installation)
+- [The full tour](#the-full-tour)
+- [The transaction that justifies the package](#the-transaction-that-justifies-the-package)
+- [Concurrency: what may be called from where](#concurrency-what-may-be-called-from-where)
+- [Schema changes](#schema-changes)
+- [Knowing when something went wrong](#knowing-when-something-went-wrong)
+- [The log as an audit trail](#the-log-as-an-audit-trail)
+- [Watching for changes](#watching-for-changes)
+- [Reading from a second process](#reading-from-a-second-process)
+- [What it does not do](#what-it-does-not-do)
+- [API](#api)
+- [On disk](#on-disk)
+- [Durability, per database](#durability-per-database)
+- [Backup](#backup)
+- [Tests](#tests)
 
 ---
 
@@ -20,9 +56,9 @@ Requires Go 1.25 or newer, as declared in `go.mod`. The language floor is 1.23
 
 ---
 
-## Usage
+## The full tour
 
-The whole API, in one program:
+Everything the package does, in one program:
 
 ```go
 package main
@@ -59,7 +95,7 @@ func main() {
     // 2. Declare the collections and indexes BEFORE opening — replaying the log
     //    has to know where records belong and which indexes to rebuild. Calling
     //    any of these after Open panics rather than quietly losing data.
-    orders := datastore.Register[*Order](db, "orders", datastore.Version(1))
+    orders := datastore.Register[*Order](db, "orders", datastore.SchemaVersion(1))
 
     // Three kinds of index. All are rebuilt at Open, never stored on disk.
     byCustomer := datastore.AddIndex(orders, "customer", // many records per term
@@ -109,7 +145,7 @@ func main() {
     }
 
     // Query through the indexes.
-    fmt.Println("orders for cust-7:", len(byCustomer.Get("cust-7")))
+    fmt.Println("orders for cust-7:", len(byCustomer.Find("cust-7")))
     if o, ok := byNumber.Get("2607/1"); ok {
         fmt.Println("found by number:", o.ID)
     }
@@ -145,7 +181,10 @@ err := db.Update(func(tx *datastore.Tx) error {
     o := datastore.In(tx, orders)
     c := datastore.In(tx, customers)
 
-    cust, _ := c.Get(customerID)
+    cust, ok := c.Get(customerID)
+    if !ok {
+        return ErrNoSuchCustomer
+    }
     if cust.Bonus < spend {
         return ErrInsufficientBonus
     }
@@ -153,20 +192,61 @@ err := db.Update(func(tx *datastore.Tx) error {
     if err := c.Put(cust); err != nil {
         return err
     }
-    return o.Put(&Order{ID: tx.NextID("order"), Num: tx.NextOrderNum(now)})
+
+    period, seq := tx.NextInPeriod("order", now, "0601")
+    return o.Put(&Order{
+        ID:  tx.NextID("order"),
+        Num: fmt.Sprintf("%s/%d", period, seq),
+    })
 })
 ```
 
 One log frame, one fsync. Returning an error from the function rolls everything
 back and writes nothing.
 
+Read *inside* the transaction, through `In(tx, c)`, when the write depends on
+what you read. `Get` outside `Update` followed by `Put` inside it is a
+lost-update waiting to happen: the writer lock serialises the writes, not your
+read-then-write pair.
+
 Queue outbound email *inside* the transaction as a record, and send it from a
 worker outside. Then a crash after commit still sends the mail, and an SMTP
 failure never rolls back an order.
 
-Do not call `Update` from inside `Update`. There is no reliable way to detect
-that in Go, so instead of hanging forever the writer slot times out and panics
-with an explanation.
+Do not call `Update` from inside `Update`. It can never proceed — the slot it
+waits for is the one it already holds — so it is detected and panics immediately
+with an explanation rather than deadlocking.
+
+---
+
+## Concurrency: what may be called from where
+
+One writer at a time; readers never block each other. `Update` runs your
+function *without* holding the state lock, so a transaction's body and its fsync
+never block readers — only the brief moment where an already-durable commit is
+applied to memory.
+
+That leaves one rule worth knowing, because getting it wrong hangs rather than
+errors:
+
+| Where you are | Read with | Not with |
+|---|---|---|
+| Outside any transaction | `orders.Get`, `byTag.Find`, `orders.All()` | — |
+| Inside `Update` or `View` | `In(tx, orders)`, `InIndex(tx, byTag)`, `InUnique(tx, byEmail)`, `InSorted(tx, byDate)` | `orders.Get`, `byTag.Find` — the direct methods |
+
+`View` holds the read lock for its whole callback, and the direct methods take
+that lock again. Go's `sync.RWMutex` is not reentrant: a second `RLock` with a
+writer queued in between deadlocks. The `In*` wrappers know the lock is already
+held, which is what makes them safe in both contexts — use them and the
+distinction never bites you.
+
+Two smaller ones:
+
+- `Collection.All()` holds the read lock for the whole iteration, so its body
+  must not write. Collect keys first, then write after the loop.
+- Index reads inside a transaction see *committed* state. A record staged
+  earlier in the same transaction is not indexed until commit; read it back
+  through `In(tx, c).Get`.
 
 ---
 
@@ -178,7 +258,7 @@ changed unit, a struct split in two — where the old records are still valid JS
 but no longer mean what the new code thinks.
 
 ```go
-users := datastore.Register[*User](db, "users", datastore.Version(2))
+users := datastore.Register[*User](db, "users", datastore.SchemaVersion(2))
 datastore.Migrate(users, 1, func(raw json.RawMessage) (json.RawMessage, error) {
     // v1 stored "name"; v2 stores "full_name"
     var m map[string]json.RawMessage
@@ -219,12 +299,21 @@ if rep := db.Recovery(); rep.LostData() {
 }
 ```
 
-`Clean()` is the stricter question — nothing skipped, truncated, or migrated.
+`LostData()` is the question to page someone about. `Clean()` is stricter —
+nothing skipped, truncated, *or migrated* — so it is false after a routine
+schema bump; treat it as "the disk was exactly what this build expected", not as
+an alarm.
 
 `db.Verify()` rebuilds every index from the records and reports disagreements.
 The indexes are derived state maintained incrementally, and nothing else ever
 checks them against their source; run this in CI or behind an admin command.
 `dstest.Open` runs it automatically when a test finishes.
+
+If a log write ever fails, the store latches that failure and every later write
+returns `ErrFailed`. The log may hold a torn frame at that point, and anything
+written after it would be discarded by the next replay — so refusing is what
+keeps "`Update` returned nil" meaning "this survives a crash". Reopen to
+recover whatever the log still holds.
 
 Set `Options.MaxBytes` to the size the dataset is expected to stay under. It
 enforces nothing — it logs when you cross the threshold and reports `Bytes` and
@@ -244,8 +333,9 @@ db.Update(func(tx *datastore.Tx) error {
 })
 ```
 
-Read it back with `History`, which reports each commit's annotations *and the
-values as they were written* — something the current state cannot tell you:
+Read it back with `History`, which reports each commit's annotations — the
+`Meta` map is exactly what `Note` put there — *and the values as they were
+written*, something the current state cannot tell you:
 
 ```go
 err := db.History(0, 0, func(e datastore.HistoryEntry) error {
@@ -264,7 +354,7 @@ either bound to keep segments instead:
 
 ```go
 datastore.Options{
-    HistorySegments: 20,             // keep the newest 20 compacted segments
+    HistorySegments: 20,                  // keep the newest 20 compacted segments
     HistoryFor:      30 * 24 * time.Hour, // ...and nothing older than 30 days
 }
 ```
@@ -273,6 +363,10 @@ Compaction then renames `wal.log` aside as `archive-<seq>.log` rather than
 emptying it. Archives are history only — their frames are already in the
 snapshot, so recovery never replays them, and deleting one costs you history,
 never state. `Stats` reports `ArchiveSegments` and `ArchiveBytes`.
+
+A damaged archive returns `ErrCorruptFrame` rather than reading as a shorter
+history: an audit trail with an invisible hole is worse than an error. A torn
+tail on the *live* log is a normal crash artifact and simply ends the scan.
 
 ## Watching for changes
 
@@ -290,7 +384,7 @@ for ev := range sub.Events() {
 
 Events are delivered after the change is both durable and applied, so a
 subscriber that reads the database on receipt sees it, and they arrive in commit
-order.
+order. Each subscriber gets its own copy of `Value` and `Meta`.
 
 **A subscriber can never slow a commit down.** Delivery is best-effort into a
 bounded queue; a subscriber that stops reading has events dropped and is told how
@@ -339,7 +433,9 @@ linear scan is measured in microseconds.
 
 It assumes **the whole dataset fits comfortably in RAM**. That assumption is what
 justifies deleting most of what a database normally does. When it stops holding,
-export: the on-disk format is plain JSON precisely so that stays easy.
+export: the on-disk format is plain JSON precisely so that stays easy. Note that
+compaction marshals the whole dataset before writing it, so peak memory during a
+snapshot is roughly twice the data.
 
 Only one process may have a directory open. The lock is advisory but enforced at
 `Open`, which is why an admin interface has to live in the same process as the
@@ -364,7 +460,7 @@ application rather than beside it.
 | `(*DB) Stats() Stats` | Point-in-time summary for an admin screen or health check. |
 | `(*DB) Recovery() RecoveryReport` | What the last `Open` found — and what it could not use. |
 | `(*DB) Verify() error` | Rebuilds every index from the records and reports disagreements. |
-| `(*DB) History(from, to, fn) error` | Replays past commits, with annotations and the values as written. |
+| `(*DB) History(from, to, fn) error` | Replays past commits, with annotations and the values as written. `to` of 0 means no upper bound. |
 | `(*DB) Watch(WatchOptions) *Subscription` | Live change feed; never blocks a commit. |
 | `(*DB) ReadOnly() bool` / `(*DB) Dir() string` | How it was opened, and where. |
 
@@ -372,7 +468,7 @@ application rather than beside it.
 
 | Function | Description |
 |---|---|
-| `Register[T Entity](db, name, opts...) *Collection[T]` | Declares a collection. Before `Open`; panics after. Pass `Version(n)` to version its schema. |
+| `Register[T Entity](db, name, opts...) *Collection[T]` | Declares a collection. Before `Open`; panics after. Pass `SchemaVersion(n)` to version its schema. |
 | `Migrate[T](c, from, fn)` | Declares the step carrying records from version `from` to `from+1`. |
 | `(*Collection[T]) Get(key) (T, bool)` | A freshly decoded copy, never a shared pointer. |
 | `(*Collection[T]) Put(v T) error` | Single-operation transaction. |
@@ -381,7 +477,8 @@ application rather than beside it.
 | `(*Collection[T]) Keys() []string` / `Len() int` | Sorted key snapshot; record count. |
 | `In[T](tx, c) *TxCollection[T]` | Scopes a collection to a transaction. |
 | `(*TxCollection[T]) Get / Put / Delete` | Reads see this transaction's own uncommitted writes. |
-| `(*Tx) Note(key, value string)` | Attaches context to the commit, readable later through `History`. |
+| `(*TxCollection[T]) Keys / Len / All` | The collection as this transaction sees it, staged writes included. |
+| `(*Tx) Note(key, value string)` | Attaches context to the commit, readable later as `Meta` through `History` and `Watch`. |
 | `(*Tx) NextID(name string) uint64` | Monotonic counter, permanent only on commit. |
 | `(*Tx) NextInPeriod(name, t, layout) (string, uint64)` | A counter that restarts each period — `"0601"` monthly, `"2006"` yearly. |
 
@@ -389,9 +486,10 @@ application rather than beside it.
 
 | Function | Description |
 |---|---|
-| `AddIndex[T](c, name, func(T) []string) *Index[T]` | Multi-valued. `Get(term) []T`, `Count(term) int`, `Terms() []string`. |
+| `AddIndex[T](c, name, func(T) []string) *Index[T]` | Multi-valued. `Find(term) []T`, `Count(term) int`, `Terms() []string`. |
 | `AddUnique[T](c, name, func(T) string) *UniqueIndex[T]` | At most one record per term. `Get(term) (T, bool)`. A `""` term opts the record out. |
-| `AddSorted[T](c, name, func(T) int64) *SortedIndex[T]` | Ordered by an int64. `Range(lo, hi)`, `Asc(limit, offset)`, `Desc(limit, offset)`, `Len()`. |
+| `AddSorted[T](c, name, func(T) int64) *SortedIndex[T]` | Ordered by an int64. `Range(lo, hi)`, `Asc(limit, offset)`, `Desc(limit, offset)`, `Len()`. A limit of 0 means no limit. |
+| `InIndex` / `InUnique` / `InSorted` | Scope an index to a transaction. Required inside `View`; see [Concurrency](#concurrency-what-may-be-called-from-where). |
 
 All three must be declared before `Open`.
 
@@ -403,11 +501,11 @@ All three must be declared before `Open`.
 | `Sync` | `SyncAlways` | See [Durability](#durability-per-database). |
 | `SyncEvery` | `5s` | Flush period under `SyncInterval`. |
 | `CompactAfterBytes` | `8 MiB` | Compact once the log passes this size. |
-| `CompactInterval` | `15m` | Periodic compaction. Negative disables the timer. |
+| `CompactInterval` | `15m` | Periodic compaction. `CompactNever` disables the timer. |
 | `KeepSnapshots` | `2` | Snapshots retained. Minimum 2 — the previous one is what makes a crash during installation survivable. |
 | `Logger` | no-op | `*zerolog.Logger` receiving recovery and compaction events. |
 | `Clock` | `time.Now` | Supplies commit timestamps. |
-| `WriteTimeout` | `30s` | How long `Update` waits for the writer slot before panicking. |
+| `WriteTimeout` | `30s` | How long `Update` waits for the writer slot before returning `ErrWriteTimeout`. |
 | `MaxBytes` | `0` (off) | Size the dataset is expected to stay under. Warns; enforces nothing. |
 | `WarnAtPercent` | `80` | Fraction of `MaxBytes` that triggers the warning. |
 | `OnCommit` | none | Called with a `CommitStats` after each commit, for metrics. |
@@ -421,11 +519,18 @@ All three must be declared before `Open`.
 | `ErrNotOpen` | Used before `Open` or after `Close`. |
 | `ErrAlreadyOpen` | `Open` called twice. |
 | `ErrLocked` | Another process holds the directory lock. |
-| `ErrDuplicateKey` | Unique index violation. Surfaces from `Update`, not from `Put`. |
+| `ErrInvalidLog` | `wal.log` in the directory is not a datastore log — wrong `Options.Dir`. |
+| `ErrLogVersion` | The log was written by a newer datastore build. |
+| `ErrUniqueViolation` | Unique index violation. Surfaces from `Update`, not from `Put`. |
 | `ErrReadOnly` | A write was attempted inside `View`, or against an `OpenReader` database. |
 | `ErrTxDone` | Transaction used after it finished. |
 | `ErrEmptyKey` | `Key()` returned `""`. Keys address records in the log, so an empty one is unrecoverable rather than merely odd. |
-| `ErrCorruptFrame` | A log frame failed its checksum or length check. |
+| `ErrWriteTimeout` | The writer slot did not free up within `WriteTimeout`. |
+| `ErrFailed` | A log write failed; no further writes are accepted. Reopen to recover. |
+| `ErrCorruptFrame` | A frame in an archived segment failed its checksum or length check, reported by `History`. |
+
+`ErrDuplicateKey` and `Version` remain as deprecated aliases for
+`ErrUniqueViolation` and `SchemaVersion`.
 
 ---
 
@@ -433,9 +538,10 @@ All three must be declared before `Open`.
 
 ```
 dir/
-  LOCK                  exclusive, held for the lifetime of the process
-  snapshot-000412.json  full state as of sequence 412
-  wal.log               framed, append-only, everything after that
+  LOCK                        exclusive, held for the lifetime of the process
+  snapshot-000000000412.json  full state as of sequence 412
+  wal.log                     framed, append-only, everything after that
+  archive-000000000412.log    a past segment, kept only when History is enabled
 ```
 
 A frame is `u32 length | u32 crc32c | JSON payload`. Recovery loads the newest
@@ -529,24 +635,9 @@ The crash tests are the reason to trust any of this:
 Do not weaken these to make a change land. Without them this is a JSON file with
 extra steps.
 
----
-
-## Relationship to v0.x
-
-`v1.0.0` was a rewrite that keeps v0's good idea — atomic rename plus fsync —
-and adds the log, transactions, typed collections and indexes. The old API
-(`New(ctx, path, opts...)`, `Set`/`Get`/`Delete` over a single JSON file) is
-gone; there is no compatibility shim and no automatic conversion. To move data
-across, read the old file and write the values into a registered collection.
-
-Two v0 behaviours are deliberately not carried over: it installed a process-wide
-signal handler and called `os.Exit` from library code, and its file locking
-compiled on neither platform (the Unix build referenced a field that did not
-exist; the Windows build returned an error unconditionally, so the default
-configuration always failed to open).
-
-Note that this is a different thing from a *schema* migration, which the store
-does support — see [Schema changes](#schema-changes).
+`dstest` has the boilerplate for consumers' tests: `dstest.New(t)` gives an
+unopened database in a temp directory configured for speed, and `dstest.Open(t,
+db)` opens it and arranges for `Verify` plus `Close` when the test ends.
 
 ---
 

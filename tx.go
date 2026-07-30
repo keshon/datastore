@@ -3,6 +3,7 @@ package datastore
 import (
 	"encoding/json"
 	"fmt"
+	"iter"
 	"sort"
 	"time"
 )
@@ -63,7 +64,9 @@ func (tx *Tx) Note(key, value string) {
 // transaction of their own. Doing so is caught and panics immediately with an
 // explanation; use In(tx, c) to write to a collection from inside a transaction.
 func (db *DB) Update(fn func(*Tx) error) error {
-	db.acquireWriter()
+	if err := db.acquireWriter(); err != nil {
+		return err
+	}
 	defer db.releaseWriter()
 
 	db.mu.RLock()
@@ -75,6 +78,9 @@ func (db *DB) Update(fn func(*Tx) error) error {
 	}
 	if readOnly {
 		return ErrReadOnly
+	}
+	if err := db.failedErr(); err != nil {
+		return err
 	}
 
 	tx := &Tx{
@@ -110,17 +116,18 @@ const reentrantMsg = "datastore: Update called from inside another Update on the
 	"goroutine — it can never proceed. Write through In(tx, collection) instead of " +
 	"Collection.Put/Delete (each of those is its own transaction)."
 
-func (db *DB) acquireWriter() {
+func (db *DB) acquireWriter() error {
 	select {
 	case db.writeCh <- struct{}{}:
 		db.writerGoid.Store(goid())
-		return
+		return nil
 	default:
 	}
 
-	// The slot is taken. If this very goroutine holds it, waiting is futile: the
-	// only outcome is the timeout panic, WriteTimeout from now. Say so at once,
-	// while the stack still shows who did it.
+	// The slot is taken. If this very goroutine holds it, waiting is futile —
+	// it can never be freed by the goroutine that is waiting for it. That is a
+	// programming error, not a runtime condition, so it panics at once, while
+	// the stack still shows who did it.
 	if id := goid(); id != 0 && db.writerGoid.Load() == id {
 		panic(reentrantMsg)
 	}
@@ -130,11 +137,12 @@ func (db *DB) acquireWriter() {
 	select {
 	case db.writeCh <- struct{}{}:
 		db.writerGoid.Store(goid())
+		return nil
 	case <-timer.C:
-		panic(fmt.Sprintf(
-			"datastore: no writer slot after %s. The usual cause is calling Update "+
-				"from inside another Update; a transaction must not start one.",
-			db.opts.WriteTimeout))
+		// A slow disk or a long compaction is a runtime condition, not a bug:
+		// report it as an error the caller can handle, retry, or log.
+		return fmt.Errorf("%w after %s; if another goroutine is stuck inside "+
+			"Update, that is the thing to fix", ErrWriteTimeout, db.opts.WriteTimeout)
 	}
 }
 
@@ -209,10 +217,19 @@ func (db *DB) commit(tx *Tx) error {
 		}
 	}
 
+	buf, err := encodeFrame(frame)
+	if err != nil {
+		return err // nothing touched the disk; the store is still healthy
+	}
+
 	sync := db.opts.Sync == SyncAlways
 	started := time.Now()
-	if err := db.wal.append(frame, sync); err != nil {
-		return err
+	if err := db.wal.append(buf, sync); err != nil {
+		// The log may now hold a torn frame. Anything appended after it would
+		// be silently dropped by the next replay while this process kept
+		// acknowledging commits — so stop accepting writes instead.
+		db.fail(err)
+		return fmt.Errorf("%w: %v", ErrFailed, err)
 	}
 	durable := time.Since(started)
 
@@ -228,18 +245,23 @@ func (db *DB) commit(tx *Tx) error {
 
 	db.mu.Lock()
 	if err := db.applyFrameLocked(frame); err != nil {
+		// The frame is already durable, so state and log have diverged. That is
+		// not recoverable in place, and every later write would build on state
+		// the log does not describe — so latch the failure. The next Open
+		// replays the frame and fails the same way, which is the honest outcome.
+		if db.failed == nil {
+			db.failed = fmt.Errorf("applying durable frame %d: %w", frame.Seq, err)
+			db.log.Error().Err(db.failed).Msg("datastore_failed: refusing further writes")
+		}
 		db.mu.Unlock()
-		// The frame is already durable, so state and log have diverged. That
-		// is not recoverable in place; the next Open replays the frame and
-		// will fail the same way, which is the honest outcome.
 		return fmt.Errorf("datastore: applying a durable frame failed, state is inconsistent: %w", err)
 	}
 	db.seq = frame.Seq
 	if !sync {
 		db.unsynced = true
 	}
-	needCompact := db.wal.size >= db.opts.CompactAfterBytes
-	walBytes := db.wal.size
+	walBytes := db.wal.sizeNow()
+	needCompact := walBytes >= db.opts.CompactAfterBytes
 	db.checkBudgetLocked()
 	db.mu.Unlock()
 
@@ -333,6 +355,10 @@ func (tc *TxCollection[T]) Get(key string) (T, bool) {
 			}
 			v, err := tc.c.decode(op.raw)
 			if err != nil {
+				// Unreachable in practice: the bytes came from Put's Marshal
+				// moments ago. Logged for the same reason as in getLocked.
+				tc.tx.db.log.Error().Err(err).Str("collection", tc.c.name).Str("key", key).
+					Msg("record_undecodable: hidden from reads")
 				var zero T
 				return zero, false
 			}
@@ -387,6 +413,50 @@ func (tc *TxCollection[T]) stage(key string, op pendingOp) {
 	ops[key] = op
 }
 
+// Len reports how many records the collection holds as this transaction sees
+// it: the committed count adjusted for its own staged writes.
+func (tc *TxCollection[T]) Len() int { return len(tc.Keys()) }
+
+// Keys returns every key as this transaction sees it, sorted: the committed
+// keys, plus its own staged puts, minus its own staged deletes.
+func (tc *TxCollection[T]) Keys() []string {
+	merged := make(map[string]struct{})
+	tc.tx.withRead(func() {
+		for k := range tc.c.data {
+			merged[k] = struct{}{}
+		}
+	})
+	for key, op := range tc.tx.writes[tc.c.name] {
+		if op.del {
+			delete(merged, key)
+		} else {
+			merged[key] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// All iterates every record in key order as this transaction sees it,
+// including its own uncommitted writes.
+func (tc *TxCollection[T]) All() iter.Seq[T] {
+	return func(yield func(T) bool) {
+		for _, k := range tc.Keys() {
+			v, ok := tc.Get(k)
+			if !ok {
+				continue
+			}
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
+
 func (tx *Tx) checkWritable() error {
 	if tx.done {
 		return ErrTxDone
@@ -395,4 +465,118 @@ func (tx *Tx) checkWritable() error {
 		return ErrReadOnly
 	}
 	return nil
+}
+
+// --- indexes inside a transaction -----------------------------------------
+//
+// Index methods called directly — byCustomer.Find(...) — take the state lock,
+// and View holds that lock for its whole callback: calling one from the other
+// deadlocks the moment a writer is queued. These wrappers are the way to read
+// an index from inside View or Update.
+//
+// They read committed state. A transaction's own staged writes are not indexed
+// until commit, so a record put earlier in the same transaction is not yet
+// findable through any index — read it back through In(tx, c).Get instead.
+
+// TxIndex is a multi-valued index as read from inside a transaction.
+type TxIndex[T Entity] struct {
+	tx *Tx
+	i  *Index[T]
+}
+
+// InIndex scopes a multi-valued index to a transaction.
+func InIndex[T Entity](tx *Tx, i *Index[T]) *TxIndex[T] {
+	if i.coll.db != tx.db {
+		panic("datastore: index " + i.name + " belongs to a different database")
+	}
+	return &TxIndex[T]{tx: tx, i: i}
+}
+
+// Find returns every committed record carrying the term, in key order.
+func (ti *TxIndex[T]) Find(term string) []T {
+	var out []T
+	ti.tx.withRead(func() { out = ti.i.findLocked(term) })
+	return out
+}
+
+// Count reports how many committed records carry the term.
+func (ti *TxIndex[T]) Count(term string) int {
+	var n int
+	ti.tx.withRead(func() { n = len(ti.i.byTerm[term]) })
+	return n
+}
+
+// Terms lists every term currently present, sorted.
+func (ti *TxIndex[T]) Terms() []string {
+	var out []string
+	ti.tx.withRead(func() { out = ti.i.termsLocked() })
+	return out
+}
+
+// TxUniqueIndex is a unique index as read from inside a transaction.
+type TxUniqueIndex[T Entity] struct {
+	tx *Tx
+	u  *UniqueIndex[T]
+}
+
+// InUnique scopes a unique index to a transaction.
+func InUnique[T Entity](tx *Tx, u *UniqueIndex[T]) *TxUniqueIndex[T] {
+	if u.coll.db != tx.db {
+		panic("datastore: index " + u.name + " belongs to a different database")
+	}
+	return &TxUniqueIndex[T]{tx: tx, u: u}
+}
+
+// Get returns the committed record holding the term, if any.
+func (tu *TxUniqueIndex[T]) Get(term string) (T, bool) {
+	var (
+		v  T
+		ok bool
+	)
+	tu.tx.withRead(func() { v, ok = tu.u.getLocked(term) })
+	return v, ok
+}
+
+// TxSortedIndex is a sorted index as read from inside a transaction.
+type TxSortedIndex[T Entity] struct {
+	tx *Tx
+	s  *SortedIndex[T]
+}
+
+// InSorted scopes a sorted index to a transaction.
+func InSorted[T Entity](tx *Tx, s *SortedIndex[T]) *TxSortedIndex[T] {
+	if s.coll.db != tx.db {
+		panic("datastore: index " + s.name + " belongs to a different database")
+	}
+	return &TxSortedIndex[T]{tx: tx, s: s}
+}
+
+// Range returns committed records whose key falls in [lo, hi], ascending.
+func (ts *TxSortedIndex[T]) Range(lo, hi int64) []T {
+	var out []T
+	ts.tx.withRead(func() { out = ts.s.rangeLocked(lo, hi) })
+	return out
+}
+
+// Asc returns up to limit committed records in ascending order, skipping
+// offset. A limit of zero means no limit.
+func (ts *TxSortedIndex[T]) Asc(limit, offset int) []T {
+	var out []T
+	ts.tx.withRead(func() { out = ts.s.materialise(window(ts.s.entries, limit, offset, false)) })
+	return out
+}
+
+// Desc returns up to limit committed records in descending order, skipping
+// offset. A limit of zero means no limit.
+func (ts *TxSortedIndex[T]) Desc(limit, offset int) []T {
+	var out []T
+	ts.tx.withRead(func() { out = ts.s.materialise(window(ts.s.entries, limit, offset, true)) })
+	return out
+}
+
+// Len reports how many committed records are indexed.
+func (ts *TxSortedIndex[T]) Len() int {
+	var n int
+	ts.tx.withRead(func() { n = len(ts.s.entries) })
+	return n
 }

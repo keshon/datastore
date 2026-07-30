@@ -12,8 +12,8 @@ import (
 // New returns an unopened database in t.TempDir(), configured for tests:
 // no fsync, no periodic compaction, and a no-op logger.
 //
-// Register collections and indexes on it, then call Open — or use Opened, which
-// does that for you. The database is closed when the test finishes.
+// Register collections and indexes on it, then call Open, which also arranges
+// for the database to be verified and closed when the test finishes.
 //
 //	db := dstest.New(t)
 //	users := datastore.Register[*User](db, "users")
@@ -23,7 +23,7 @@ func New(t testing.TB, tweak ...func(*datastore.Options)) *datastore.DB {
 	opts := datastore.Options{
 		Dir:             t.TempDir(),
 		Sync:            datastore.SyncNever,
-		CompactInterval: -1,
+		CompactInterval: datastore.CompactNever,
 	}
 	for _, fn := range tweak {
 		fn(&opts)

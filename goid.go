@@ -16,8 +16,9 @@ import (
 // and then panicking anyway.
 //
 // It is never used for correctness — every caller treats 0 as "unknown" and
-// falls back to the timeout path — and it only runs when the slot is already
-// contended, which is rare.
+// falls back to the timeout path. It runs on every writer-slot acquisition to
+// record the owner; a single-goroutine runtime.Stack is a microsecond or so,
+// which is noise next to the fsync every commit already pays.
 func goid() uint64 {
 	var buf [64]byte
 	b := buf[:runtime.Stack(buf[:], false)]

@@ -43,6 +43,10 @@ var errStopHistory = errors.New("datastore: stop history")
 // compaction are visible. Reading is O(bytes on disk) and touches no in-memory
 // state, so it is safe to call on a live database — including one opened with
 // OpenReader.
+//
+// A damaged archive segment surfaces as ErrCorruptFrame rather than being
+// silently skipped: an audit trail with an invisible hole is worse than an
+// error.
 func (db *DB) History(from, to uint64, fn func(HistoryEntry) error) error {
 	db.mu.RLock()
 	opened := db.opened && !db.closed
@@ -58,12 +62,19 @@ func (db *DB) History(from, to uint64, fn func(HistoryEntry) error) error {
 	}
 
 	// Archives oldest first, then the live log, which together are the commits
-	// in sequence order.
-	paths := make([]string, 0, len(segments)+1)
-	for _, seq := range segments {
-		paths = append(paths, filepath.Join(dir, archiveName(seq)))
+	// in sequence order. Archives are scanned strictly — they were written
+	// complete, so a frame that no longer reads back is ErrCorruptFrame, not a
+	// quiet end of history. The live log is scanned leniently: a torn tail
+	// there is a normal crash artifact and simply means history stops.
+	type segment struct {
+		path   string
+		strict bool
 	}
-	paths = append(paths, filepath.Join(dir, walName))
+	paths := make([]segment, 0, len(segments)+1)
+	for _, seq := range segments {
+		paths = append(paths, segment{filepath.Join(dir, archiveName(seq)), true})
+	}
+	paths = append(paths, segment{filepath.Join(dir, walName), false})
 
 	visit := func(fr *walFrame) error {
 		if fr.Seq < from {
@@ -89,8 +100,8 @@ func (db *DB) History(from, to uint64, fn func(HistoryEntry) error) error {
 		return fn(entry)
 	}
 
-	for _, path := range paths {
-		if err := scanFrames(path, visit); err != nil {
+	for _, seg := range paths {
+		if err := scanFrames(seg.path, seg.strict, visit); err != nil {
 			if errors.Is(err, errStopHistory) {
 				return nil
 			}

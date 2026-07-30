@@ -35,7 +35,7 @@ func (db *DB) Verify() error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	if !db.opened {
+	if !db.opened || db.closed {
 		return ErrNotOpen
 	}
 
