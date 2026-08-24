@@ -14,6 +14,9 @@
 //     before Update returns, so an acknowledged commit survives the machine
 //     stopping, not merely the process. See powerloss_test.go, which runs the
 //     log on a device where only fsync makes anything durable.
+//   - Group commit. Concurrent commits share one fsync rather than queueing for
+//     their own, without weakening any of the above: a frame is applied to
+//     memory, and so becomes visible, only after the fsync that covers it.
 //   - Real transactions. Several records across several collections commit as
 //     one atomic unit, which is what placing an order actually requires:
 //     write the order, debit the loyalty balance, consume the promo code, and

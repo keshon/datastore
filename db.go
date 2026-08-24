@@ -173,6 +173,15 @@ type DB struct {
 	seq      uint64
 	counters map[string]uint64
 
+	// appendSeq is the highest sequence written to the log, which runs ahead of
+	// seq whenever frames are appended but not yet applied. Sequences must be
+	// assigned from it, not from seq, or a batch would reuse numbers. Guarded
+	// by the writer slot, which is the only thing that assigns them.
+	appendSeq uint64
+
+	// group coordinates commits that share an fsync. See groupcommit.go.
+	group *groupState
+
 	// diskVersions holds each collection's on-disk schema version during
 	// recovery, so restored records can be migrated as they are applied. It is
 	// cleared once Open finishes: from then on everything in memory is current.
@@ -233,6 +242,7 @@ func New(opts Options) *DB {
 		counters:       make(map[string]uint64),
 		stop:           make(chan struct{}),
 		openLog:        osLogOpener,
+		group:          newGroupState(),
 	}
 }
 
@@ -406,6 +416,9 @@ func (db *DB) restoreLocked() error {
 			Str("reason", res.Reason).
 			Msg("wal_truncated")
 	}
+
+	// Nothing is in flight after recovery, so the two sequences agree again.
+	db.appendSeq = db.seq
 
 	rep.WALFrames = res.Frames
 	rep.Truncated = res.Truncated
@@ -603,6 +616,13 @@ func (db *DB) Compact() error {
 		return err
 	}
 	defer db.releaseWriter()
+
+	// Frames may be in the log but not yet applied. Snapshotting the state
+	// without them and then truncating the log would destroy commits their
+	// writers are still waiting on, so close the window first.
+	if err := db.drainPending(); err != nil {
+		return err
+	}
 	return db.compactExclusive()
 }
 

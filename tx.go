@@ -55,9 +55,21 @@ func (tx *Tx) Note(key, value string) {
 
 // Update runs fn in a read-write transaction and commits if it returns nil.
 //
-// One writer runs at a time. fn executes without the state lock held, so
-// readers are never blocked by a transaction's body or by its fsync — only by
-// the brief moment where an already-durable commit is applied to memory.
+// One transaction body runs at a time. fn executes without the state lock
+// held, so readers are never blocked by a transaction's body or by its fsync —
+// only by the brief moment where an already-durable commit is applied to
+// memory.
+//
+// Under SyncAlways the writer slot is handed back once the frame is in the log,
+// before the fsync, so the next transaction runs its body and appends while
+// this one is still waiting for the disk. Several commits then share a single
+// fsync. Update still returns only when this commit is durable, and nothing is
+// visible to any reader before that (see groupcommit.go).
+//
+// A transaction that reads waits for commits already in flight to become
+// durable, so a read-then-write sequence still sees everything that precedes
+// it. Write-only transactions — including Collection.Put and Collection.Delete
+// — never wait, which is why throughput scales with concurrent writers.
 //
 // Do not call Update from inside fn — including indirectly, through the
 // convenience methods Collection.Put and Collection.Delete, which are each a
@@ -67,7 +79,18 @@ func (db *DB) Update(fn func(*Tx) error) error {
 	if err := db.acquireWriter(); err != nil {
 		return err
 	}
-	defer db.releaseWriter()
+	// The slot is released as soon as the frame is in the log, not when this
+	// returns: waiting for the fsync while holding it is what made concurrent
+	// commits serialise. commit hands it back at the right moment; the defer is
+	// the backstop for every path that returns before then.
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			db.releaseWriter()
+		}
+	}
+	defer release()
 
 	db.mu.RLock()
 	ready := db.opened && !db.closed
@@ -95,7 +118,7 @@ func (db *DB) Update(fn func(*Tx) error) error {
 		return err
 	}
 	tx.done = true
-	return db.commit(tx)
+	return db.commit(tx, release)
 }
 
 // View runs fn in a read-only transaction. The read lock is held throughout, so
@@ -159,7 +182,7 @@ func (db *DB) releaseWriter() {
 // uniqueness — happens before the frame is written. Applying to memory and
 // indexes happens after the fsync and cannot fail, so the log and the state
 // can never disagree about what happened.
-func (db *DB) commit(tx *Tx) error {
+func (db *DB) commit(tx *Tx, release func()) error {
 	if len(tx.writes) == 0 && len(tx.counters) == 0 {
 		return nil
 	}
@@ -180,13 +203,22 @@ func (db *DB) commit(tx *Tx) error {
 				puts[key] = op.raw
 			}
 		}
-		if err := coll.checkUnique(puts, dels); err != nil {
+		// Frames in the commit window are in the log and will be applied, so
+		// for uniqueness they already exist. Waiting for them instead would be
+		// simpler, and would also stop any collection with a unique index from
+		// ever batching.
+		pendPuts, pendDels := db.pendingOpsFor(name)
+		if err := coll.checkUnique(puts, dels, pendPuts, pendDels); err != nil {
 			db.mu.RUnlock()
 			return err
 		}
 	}
-	seq := db.seq + 1
 	db.mu.RUnlock()
+
+	// From appendSeq, not seq: seq is what has been applied, which lags
+	// whenever frames are in flight. Only the writer slot assigns sequences, so
+	// this needs no lock of its own.
+	seq := db.appendSeq + 1
 
 	frame := &walFrame{Seq: seq, TS: db.opts.Clock().Unix()}
 	for _, name := range sortedKeys(tx.writes) {
@@ -224,13 +256,57 @@ func (db *DB) commit(tx *Tx) error {
 
 	sync := db.opts.Sync == SyncAlways
 	started := time.Now()
-	if err := db.wal.append(buf, sync); err != nil {
+
+	// Append without syncing. Under SyncAlways the fsync happens below, shared
+	// with every other commit that lands in the same window; under the other
+	// modes it does not happen here at all.
+	if err := db.wal.append(buf, false); err != nil {
 		// The log may now hold a torn frame. Anything appended after it would
 		// be silently dropped by the next replay while this process kept
 		// acknowledging commits — so stop accepting writes instead.
 		db.fail(err)
 		return fmt.Errorf("%w: %v", ErrFailed, err)
 	}
+	db.appendSeq = seq
+
+	if sync {
+		pf := db.enqueue(frame)
+
+		// Hand back the writer slot before waiting. This is the whole point:
+		// the next commit runs its body and appends while this fsync is in
+		// flight, and then shares it.
+		release()
+
+		if err := db.awaitDurable(pf); err != nil {
+			return err
+		}
+		durable := time.Since(started)
+
+		db.mu.RLock()
+		walBytes := db.wal.sizeNow()
+		needCompact := walBytes >= db.opts.CompactAfterBytes
+		db.mu.RUnlock()
+
+		if db.opts.OnCommit != nil {
+			db.opts.OnCommit(CommitStats{
+				Seq:        frame.Seq,
+				Ops:        len(frame.Ops),
+				FrameBytes: frame.encodedSize,
+				Duration:   durable,
+				Synced:     true,
+				WALBytes:   walBytes,
+			})
+		}
+		if needCompact {
+			// Compact, not compactExclusive: the writer slot was handed back
+			// above, so this has to queue for it like anybody else.
+			if err := db.Compact(); err != nil {
+				db.log.Error().Err(err).Msg("compaction_failed")
+			}
+		}
+		return nil
+	}
+
 	durable := time.Since(started)
 
 	// The frame is now durable but not yet applied. This gap is the most
@@ -317,7 +393,19 @@ func (tx *Tx) NextInPeriod(name string, t time.Time, layout string) (string, uin
 	return period, tx.NextID(name + ":" + period)
 }
 
+// withRead runs f under the state lock, or directly when the caller already
+// holds it.
+//
+// A writing transaction first closes the commit window. Frames that are in the
+// log but not yet applied are invisible to every reader, so a read-then-write
+// sequence has to wait for them or it would decide against state that is
+// already out of date. Read-only transactions need nothing: they can only ever
+// see applied state, which is by definition already durable.
 func (tx *Tx) withRead(f func()) {
+	if tx.write && !tx.db.pendingEmpty() {
+		_ = tx.db.drainPending()
+	}
+
 	if tx.holdsLock {
 		f()
 		return

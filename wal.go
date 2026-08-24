@@ -493,13 +493,26 @@ func (w *wal) reset() error {
 	return w.writeHeader()
 }
 
+// sync flushes the log, without holding mu while it waits.
+//
+// The lock covers taking the handle, not the fsync itself. Holding it across
+// the fsync would block every append for the duration -- roughly a millisecond
+// -- which is exactly the window group commit needs writers to be appending
+// into. With the lock held there, nothing ever accumulates and every commit
+// pays for its own fsync no matter how many are in flight.
+//
+// Releasing it means Close can shut the file mid-sync. That is safe: *os.File
+// refuses a call on a closed handle rather than acting on a reused descriptor,
+// so the worst case is an error, which the caller latches.
 func (w *wal) sync() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.f == nil {
+	f := w.f
+	w.mu.Unlock()
+
+	if f == nil {
 		return nil
 	}
-	return w.f.Sync()
+	return f.Sync()
 }
 
 func (w *wal) close() error {

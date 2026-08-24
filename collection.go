@@ -19,7 +19,8 @@ type anyCollection interface {
 	collName() string
 	applyPut(key string, raw json.RawMessage) error
 	applyDelete(key string)
-	checkUnique(puts map[string]json.RawMessage, dels map[string]struct{}) error
+	checkUnique(puts map[string]json.RawMessage, dels map[string]struct{},
+		pendPuts map[string]json.RawMessage, pendDels map[string]struct{}) error
 	dump() map[string]json.RawMessage
 	clear()
 	count() int
@@ -288,7 +289,15 @@ func (c *Collection[T]) dump() map[string]json.RawMessage {
 // It runs at commit, before anything is written, so a transaction may swap a
 // unique value between two records — delete-then-insert, or a straight
 // exchange — which per-Put validation would reject.
-func (c *Collection[T]) checkUnique(puts map[string]json.RawMessage, dels map[string]struct{}) error {
+// checkUnique validates this transaction's writes against every unique index.
+//
+// pendPuts and pendDels describe the commit window: records that are in the log
+// and will be applied, but are not in the index yet (see groupcommit.go). They
+// have to count as present, or two commits sharing an fsync could both claim
+// the same term and the index would be corrupt by the time either applied.
+// Both are nil in the ordinary case of nothing in flight.
+func (c *Collection[T]) checkUnique(puts map[string]json.RawMessage, dels map[string]struct{},
+	pendPuts map[string]json.RawMessage, pendDels map[string]struct{}) error {
 	if len(c.unique) == 0 || len(puts) == 0 {
 		return nil
 	}
@@ -301,8 +310,43 @@ func (c *Collection[T]) checkUnique(puts map[string]json.RawMessage, dels map[st
 		}
 		decoded[key] = v
 	}
+	inflight := make(map[string]T, len(pendPuts))
+	for key, raw := range pendPuts {
+		v, err := c.decode(raw)
+		if err != nil {
+			return err
+		}
+		inflight[key] = v
+	}
 
 	for _, idx := range c.unique {
+		// holderOf answers "who holds this term, once the window is applied".
+		// A record in flight wins over the committed index, because it is
+		// already in the log; a record the window deletes, or moves to another
+		// term, releases what it held.
+		byTermInflight := make(map[string]string, len(inflight))
+		for _, key := range sortedKeys(inflight) {
+			if term := idx.term(inflight[key]); term != "" {
+				byTermInflight[term] = key
+			}
+		}
+		holderOf := func(term string) (string, bool) {
+			if key, ok := byTermInflight[term]; ok {
+				return key, true
+			}
+			holder, taken := idx.byTerm[term]
+			if !taken {
+				return "", false
+			}
+			if _, gone := pendDels[holder]; gone {
+				return "", false
+			}
+			if v, moved := inflight[holder]; moved && idx.term(v) != term {
+				return "", false
+			}
+			return holder, true
+		}
+
 		pending := make(map[string]string, len(decoded))
 		for _, key := range sortedKeys(decoded) {
 			term := idx.term(decoded[key])
@@ -315,7 +359,7 @@ func (c *Collection[T]) checkUnique(puts map[string]json.RawMessage, dels map[st
 			}
 			pending[term] = key
 
-			holder, taken := idx.byTerm[term]
+			holder, taken := holderOf(term)
 			if !taken || holder == key {
 				continue
 			}

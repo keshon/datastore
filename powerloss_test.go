@@ -54,6 +54,12 @@ type crashDevice struct {
 	// failWrite and failSync fire once, on the next matching call, then clear.
 	failWrite error
 	failSync  error
+
+	// syncs counts fsyncs, and syncDelay makes each one cost something. A real
+	// fsync takes about a millisecond; an instant one leaves no window for
+	// commits to collect in, which is precisely what group commit needs.
+	syncs     int
+	syncDelay time.Duration
 }
 
 type crashData struct {
@@ -127,6 +133,19 @@ func (d *crashDevice) setFailSync(err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.failSync = err
+}
+
+// syncCount reports how many fsyncs the device has served.
+func (d *crashDevice) syncCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.syncs
+}
+
+func (d *crashDevice) setSyncDelay(v time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.syncDelay = v
 }
 
 func (d *crashDevice) setFailWrite(err error) {
@@ -227,7 +246,29 @@ func (f *crashFile) Sync() error {
 		f.dev.failSync = nil
 		return err
 	}
-	f.data.durable = append([]byte(nil), f.data.live...)
+	f.dev.syncs++
+
+	// What this flush is responsible for is what had been written when it
+	// started: the conservative reading, and the one that keeps the tests
+	// strict. Bytes appended while it is in flight belong to the next one.
+	snapshot := append([]byte(nil), f.data.live...)
+	d := f.dev.syncDelay
+	f.dev.mu.Unlock()
+
+	if d > 0 {
+		// Not under the device lock. A real disk does not stop accepting
+		// writes while it flushes, and pretending otherwise would hide whether
+		// commits are actually sharing an fsync.
+		time.Sleep(d)
+	}
+
+	f.dev.mu.Lock()
+	if err := f.checkLocked(); err != nil {
+		return err
+	}
+	if len(snapshot) > len(f.data.durable) {
+		f.data.durable = snapshot
+	}
 	return nil
 }
 
@@ -509,6 +550,69 @@ func TestIntervalSyncLosesASuffixNeverAHole(t *testing.T) {
 	}
 	if g.orders.Len() != survivors {
 		t.Errorf("collection holds %d records, but only %d form the surviving prefix", g.orders.Len(), survivors)
+	}
+	checkIndexes(t, g)
+}
+
+// TestGroupCommitSharesOneFsync is the proof that group commit does what it
+// claims, without depending on wall-clock timing: it counts fsyncs.
+//
+// Concurrent commits must cost fewer fsyncs than there are commits. Before
+// group commit the two numbers were equal by construction -- the writer slot
+// was held across the fsync, so nobody could be appending during one.
+func TestGroupCommitSharesOneFsync(t *testing.T) {
+	dir := t.TempDir()
+	dev := newCrashDevice()
+	dev.setSyncDelay(2 * time.Millisecond)
+
+	f := openFixtureOn(t, dir, dev, func(o *Options) {
+		o.Sync = SyncAlways
+		o.CompactAfterBytes = 1 << 40
+	})
+
+	base := dev.syncCount()
+
+	const writers, each = 8, 40
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				if err := f.orders.Put(mkOrder(fmt.Sprintf("w%d-%d", w, i))); err != nil {
+					t.Errorf("worker %d: %v", w, err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	commits := writers * each
+	syncs := dev.syncCount() - base
+	t.Logf("%d commits, %d fsyncs (%.1f commits per fsync)",
+		commits, syncs, float64(commits)/float64(syncs))
+
+	if syncs > commits/2 {
+		t.Errorf("%d commits cost %d fsyncs; concurrent commits are not sharing one", commits, syncs)
+	}
+	if syncs == 0 {
+		t.Fatal("no fsyncs at all: SyncAlways is not syncing")
+	}
+
+	// Batching must not cost correctness: every commit acknowledged above is
+	// applied, indexed, and durable.
+	if got := f.orders.Len(); got != commits {
+		t.Errorf("collection holds %d records, want %d", got, commits)
+	}
+	checkIndexes(t, f)
+
+	dev.cutPower()
+	release(t, f.db)
+
+	g := openFixtureOn(t, dir, dev)
+	if got := g.orders.Len(); got != commits {
+		t.Errorf("after power loss %d records survived, want all %d", got, commits)
 	}
 	checkIndexes(t, g)
 }

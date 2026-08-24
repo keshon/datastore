@@ -623,6 +623,32 @@ more than orders do and would otherwise dominate the log and force constant
 compaction; losing a guest cart on an unclean shutdown is fine, losing an order
 is not.
 
+### Group commit
+
+Concurrent commits share one fsync. The writer slot is handed back as soon as a
+frame is in the log, so the next transaction runs its body and appends while the
+previous one is still waiting for the disk; whichever writer gets there first
+fsyncs for everybody waiting and applies the batch in sequence order.
+
+This does not weaken anything above. `Update` still returns only once the commit
+is durable, and a frame becomes *visible* only when it is applied, which happens
+after the fsync that covers it — so a reader can still never see a commit that
+would vanish in a power cut.
+
+Two consequences worth knowing:
+
+- **A transaction that reads waits** for commits already in flight to become
+  durable, so a read-then-write sequence still observes everything before it.
+  Write-only transactions — including `Collection.Put` and `Collection.Delete` —
+  never wait. That is the shape that scales.
+- **Only `SyncAlways` batches.** The other modes never fsync on the commit path,
+  so there is nothing to amortise.
+
+`TestGroupCommitSharesOneFsync` pins the behaviour by counting fsyncs rather
+than by timing anything: 320 concurrent commits cost 79 fsyncs, about 4 commits
+per flush. Counting is deterministic, and a wall-clock assertion on a shared CI
+runner would not be.
+
 ### What `SyncAlways` guarantees
 
 **If `Update` returned `nil`, the commit survives the machine losing power.**
