@@ -43,6 +43,15 @@ var (
 	// a later format means.
 	ErrLogVersion = errors.New("datastore: log format version not supported by this build")
 
+	// ErrSnapshotVersion reports a snapshot whose envelope version this build
+	// does not understand — the state was written by a newer datastore.
+	//
+	// Unlike a damaged snapshot, this is not something to fall back from. A
+	// checksum failure means "this file is broken, try the previous one"; a
+	// future version means "this file is fine and you cannot read it", and
+	// silently opening at an older snapshot would serve stale state as current.
+	ErrSnapshotVersion = errors.New("datastore: snapshot format version not supported by this build")
+
 	// ErrCorruptFrame reports a damaged frame in an archived log segment,
 	// surfaced by History. Damage in the live log is handled by recovery —
 	// truncated and reported through RecoveryReport — but an archive was written

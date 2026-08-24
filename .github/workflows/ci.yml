@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly. The crash and fuzz jobs are the kind that fail once in fifty runs
+    # when something is subtly wrong, which a per-push trigger alone never
+    # surfaces.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Every platform, with the race detector and more crash rounds than the
+  # default. Windows earns its place here rather than being assumed: it has its
+  # own file locking, and syncDir is a no-op there, so it is the platform where
+  # the durability story is weakest and the code least exercised.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # The race detector needs a working C toolchain to link on Windows.
+      # Printing it makes a missing one an obvious first line rather than a
+      # confusing link error three steps later.
+      - name: Toolchain
+        run: |
+          go version
+          go env CC CGO_ENABLED GOOS GOARCH
+
+      - name: Build
+        run: go build ./...
+
+      # Per-platform on purpose: the locking and directory-sync files are behind
+      # build tags, so vet only sees each one on its own OS.
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        env:
+          DS_CRASH_ROUNDS: '20'
+        run: go test -race -count=1 ./...
+
+  # The exhaustive recovery sweep: the log cut short at every single byte
+  # offset, checked against a model. Too slow for the matrix above, which is
+  # exactly why it belongs in CI rather than in anyone's edit loop.
+  sweep:
+    name: exhaustive sweep (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Full recovery sweep
+        env:
+          DS_FULL_SWEEP: '1'
+          DS_CRASH_ROUNDS: '40'
+        run: go test -count=1 ./...
+
+  # Fuzzing the frame reader. A failure writes the input that caused it into
+  # testdata/fuzz, which is worth keeping: it becomes a regression seed.
+  fuzz:
+    name: fuzz frame parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Fuzz
+        run: go test -run '^$' -fuzz FuzzFrameParsing -fuzztime 300s .
+
+      - name: Upload failing corpus
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+
+  lint:
+    name: format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Tidy go.mod
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "go.mod or go.sum is out of date; run 'go mod tidy'"
+            exit 1
+          fi

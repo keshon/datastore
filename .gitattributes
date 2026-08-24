@@ -1,0 +1,4 @@
+# Go tooling assumes LF, and git already stores LF; without this the working
+# tree on Windows is CRLF and `gofmt -l` reports every file as unformatted.
+* text=auto eol=lf
+*.go text eol=lf

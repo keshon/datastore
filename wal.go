@@ -33,6 +33,47 @@ const (
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
+// logFile is the part of *os.File the log actually uses.
+//
+// It exists so the tests can substitute a device that loses power: one that
+// distinguishes bytes a running process can see from bytes that would survive
+// the machine stopping. Nothing outside this package can supply one, and the
+// only implementation in normal operation is *os.File.
+type logFile interface {
+	io.Reader
+	ReadAt(p []byte, off int64) (int, error)
+	WriteAt(p []byte, off int64) (int, error)
+	Seek(offset int64, whence int) (int64, error)
+	Sync() error
+	Truncate(size int64) error
+	Close() error
+}
+
+// logOpener opens the log and reports its current size.
+//
+// create separates a writer, which brings the file into existence, from a
+// reader, which must report os.ErrNotExist so openWALRead can treat a database
+// that has only ever been compacted as an empty log rather than an error.
+type logOpener func(path string, create bool) (logFile, int64, error)
+
+// osLogOpener is the real filesystem, and the default for every database.
+func osLogOpener(path string, create bool) (logFile, int64, error) {
+	flag := os.O_RDONLY
+	if create {
+		flag = os.O_CREATE | os.O_RDWR
+	}
+	f, err := os.OpenFile(path, flag, 0o644)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, fmt.Errorf("datastore: stat wal: %w", err)
+	}
+	return f, info.Size(), nil
+}
+
 type opKind string
 
 const (
@@ -77,7 +118,7 @@ type wal struct {
 	// interval-sync goroutine and Stats read this struct concurrently with them,
 	// and Close can nil out f under either.
 	mu   sync.Mutex
-	f    *os.File
+	f    logFile
 	path string
 	size int64
 
@@ -87,20 +128,14 @@ type wal struct {
 	readOnly bool
 }
 
-func openWAL(dir string) (*wal, error) {
+func openWAL(dir string, open logOpener) (*wal, error) {
 	path := filepath.Join(dir, walName)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, size, err := open(path, true)
 	if err != nil {
 		return nil, fmt.Errorf("datastore: open wal: %w", err)
 	}
 
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("datastore: stat wal: %w", err)
-	}
-
-	w := &wal{f: f, path: path, size: info.Size()}
+	w := &wal{f: f, path: path, size: size}
 
 	if w.size < int64(walHeaderSize) {
 		// An empty file is a new log. A short one is only ours if what is there
@@ -144,23 +179,20 @@ func openWAL(dir string) (*wal, error) {
 
 // openWALRead opens the log for reading only, tolerating a directory that has
 // no log yet (a database that has only ever been compacted).
-func openWALRead(dir string) (*wal, error) {
+func openWALRead(dir string, open logOpener) (*wal, error) {
 	path := filepath.Join(dir, walName)
-	f, err := os.Open(path)
+	f, size, err := open(path, false)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// f must stay an untyped nil here: every "is the log open" check in
+			// this file compares the interface against nil, and a typed nil
+			// pointer would pass them all and then panic on use.
 			return &wal{path: path, readOnly: true}, nil
 		}
 		return nil, fmt.Errorf("datastore: open wal: %w", err)
 	}
 
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("datastore: stat wal: %w", err)
-	}
-
-	w := &wal{f: f, path: path, size: info.Size(), readOnly: true}
+	w := &wal{f: f, path: path, size: size, readOnly: true}
 	if w.size < int64(walHeaderSize) {
 		return w, nil // nothing usable in it yet
 	}
@@ -191,6 +223,14 @@ func headerBytes() []byte {
 
 // writeHeader assumes the caller holds w.mu or has not yet shared the wal.
 func (w *wal) writeHeader() error {
+	// A closed log has to be refused explicitly. While f was an *os.File a nil
+	// one answered every call with ErrInvalid, so this read as an error on its
+	// own; against an interface a nil value panics instead. reset() reaches
+	// here during Close on a log something already closed, which is how the
+	// recovery tests leave it.
+	if w.f == nil {
+		return fmt.Errorf("datastore: write header to a closed log")
+	}
 	header := headerBytes()
 	if err := w.f.Truncate(0); err != nil {
 		return fmt.Errorf("datastore: truncate wal: %w", err)
@@ -200,6 +240,15 @@ func (w *wal) writeHeader() error {
 	}
 	if err := w.f.Sync(); err != nil {
 		return fmt.Errorf("datastore: sync wal header: %w", err)
+	}
+	// Syncing the file only makes its contents durable; on a log that has just
+	// been created, the directory entry naming it may still be lost to a power
+	// cut, taking every fsynced frame with it. The snapshot path already syncs
+	// the directory after its rename, and log creation needs the same. Reaching
+	// this from reset() costs a redundant fsync during compaction, which is
+	// doing several already.
+	if err := syncDir(filepath.Dir(w.path)); err != nil {
+		return fmt.Errorf("datastore: sync directory: %w", err)
 	}
 	w.size = int64(walHeaderSize)
 	return nil

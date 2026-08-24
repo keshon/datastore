@@ -182,6 +182,12 @@ type DB struct {
 	wal  *wal
 	lock *dirLock
 
+	// openLog is how the log file is opened, always osLogOpener outside this
+	// package's own tests. The crash-injection tests swap in a device that can
+	// lose power, which is the only way to distinguish bytes that were written
+	// from bytes that were made durable.
+	openLog logOpener
+
 	opened   bool
 	closed   bool
 	readOnly bool // opened with OpenReader: every write path refuses
@@ -226,6 +232,7 @@ func New(opts Options) *DB {
 		orphanVersions: make(map[string]int),
 		counters:       make(map[string]uint64),
 		stop:           make(chan struct{}),
+		openLog:        osLogOpener,
 	}
 }
 
@@ -371,7 +378,7 @@ func (db *DB) restoreLocked() error {
 	if db.readOnly {
 		open = openWALRead
 	}
-	w, err := open(db.opts.Dir)
+	w, err := open(db.opts.Dir, db.openLog)
 	if err != nil {
 		return err
 	}

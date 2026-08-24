@@ -38,9 +38,10 @@ func newFixture(t *testing.T, opts ...func(*Options)) *fixture {
 	return openFixture(t, dir, opts...)
 }
 
-func openFixture(t *testing.T, dir string, opts ...func(*Options)) *fixture {
-	t.Helper()
-
+// newUnopenedFixture builds the standard fixture but stops short of Open, so a
+// test can reach into the database first. The power-loss tests substitute the
+// log's filesystem that way, which has to happen before anything opens it.
+func newUnopenedFixture(dir string, opts ...func(*Options)) *fixture {
 	o := Options{Dir: dir, Sync: SyncAlways, CompactInterval: -1}
 	for _, fn := range opts {
 		fn(&o)
@@ -53,11 +54,17 @@ func openFixture(t *testing.T, dir string, opts ...func(*Options)) *fixture {
 	f.byTag = AddIndex(f.orders, "tag", func(o *order) []string { return o.Tags })
 	f.byEmail = AddUnique(f.orders, "email", func(o *order) string { return o.Email })
 	f.byDate = AddSorted(f.orders, "date", func(o *order) int64 { return o.Created })
+	return f
+}
 
-	if err := db.Open(); err != nil {
+func openFixture(t *testing.T, dir string, opts ...func(*Options)) *fixture {
+	t.Helper()
+
+	f := newUnopenedFixture(dir, opts...)
+	if err := f.db.Open(); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { _ = f.db.Close() })
 	return f
 }
 

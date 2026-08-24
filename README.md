@@ -1,5 +1,9 @@
 # datastore
 
+[![CI](https://github.com/keshon/datastore/actions/workflows/ci.yml/badge.svg)](https://github.com/keshon/datastore/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/keshon/datastore.svg)](https://pkg.go.dev/github.com/keshon/datastore)
+[![Go Report Card](https://goreportcard.com/badge/github.com/keshon/datastore)](https://goreportcard.com/report/github.com/keshon/datastore)
+
 An embedded store for data that must not be lost. Everything lives in memory;
 every commit is appended to a write-ahead log and fsynced before it is
 acknowledged.
@@ -521,6 +525,7 @@ All three must be declared before `Open`.
 | `ErrLocked` | Another process holds the directory lock. |
 | `ErrInvalidLog` | `wal.log` in the directory is not a datastore log — wrong `Options.Dir`. |
 | `ErrLogVersion` | The log was written by a newer datastore build. |
+| `ErrSnapshotVersion` | The snapshot was written by a newer datastore build. Unlike a damaged snapshot this is not fallen back from — an older snapshot would be stale, not merely older. |
 | `ErrUniqueViolation` | Unique index violation. Surfaces from `Update`, not from `Put`. |
 | `ErrReadOnly` | A write was attempted inside `View`, or against an `OpenReader` database. |
 | `ErrTxDone` | Transaction used after it finished. |
@@ -545,15 +550,40 @@ dir/
 ```
 
 A frame is `u32 length | u32 crc32c | JSON payload`. Recovery loads the newest
-snapshot that parses and replays the log on top, stopping at the first frame
+snapshot that verifies and replays the log on top, stopping at the first frame
 that is short, fails its checksum, or arrives out of sequence — and truncating
 there. Stopping is the point: once one decision in the log is unreadable, the
 ones after it cannot be trusted to apply to the state we think we have.
 
-Compaction writes a new snapshot, fsyncs it, and only then truncates the log.
-A crash between those two steps leaves a snapshot plus a log that replays
-cleanly on top of it: wasteful, never wrong. The previous snapshot is kept for
-the same reason.
+**Snapshots are checksummed too.** A snapshot is an envelope carrying a
+crc32c over the exact payload bytes:
+
+```json
+{"v":1,"crc32c":2882343476,"payload":{"seq":412,"collections":{...}}}
+```
+
+"It parsed as JSON" is not an integrity check — a bit flipped inside a string
+value, or inside a digit, decodes perfectly into the wrong data. Since a
+snapshot holds the whole dataset rather than one transaction's worth of it, an
+unchecked one was the largest unguarded object on disk. A snapshot that fails
+its checksum is passed over in favour of the previous one and reported through
+`RecoveryReport.SnapshotsSkipped`, which makes `LostData()` true.
+
+Snapshots written before this existed are plain payloads with no envelope. They
+still load, unverified, and the next compaction rewrites them in the checked
+format. A snapshot from a *newer* build fails with `ErrSnapshotVersion` rather
+than falling back, because quietly opening at an older snapshot would serve
+stale state as current.
+
+Compaction writes a new snapshot, fsyncs it, fsyncs the directory, and only then
+truncates the log. A crash between those steps leaves a snapshot plus a log that
+replays cleanly on top of it: wasteful, never wrong. The previous snapshot is
+kept for the same reason. Creating `wal.log` fsyncs the directory as well —
+syncing a file makes its contents durable, not the directory entry naming it.
+
+On Windows `syncDir` is a no-op, because the platform exposes no directory
+fsync. Snapshot installation there relies on NTFS metadata ordering rather than
+an explicit barrier, so the guarantee is weaker than on Unix.
 
 **Payloads are JSON deliberately.** A binary codec would be smaller and faster,
 and at a few writes per minute neither matters — whereas reading the log with
@@ -590,6 +620,29 @@ more than orders do and would otherwise dominate the log and force constant
 compaction; losing a guest cart on an unclean shutdown is fine, losing an order
 is not.
 
+### What `SyncAlways` guarantees
+
+**If `Update` returned `nil`, the commit survives the machine losing power.**
+Not just the process dying — the machine. That distinction is the whole point,
+and it is tested rather than argued: `powerloss_test.go` runs the log on a
+device that keeps what a process can read separate from what is actually on the
+platter, where only `fsync` moves bytes between them.
+
+The tests cover a power cut at an arbitrary moment under concurrent writers, a
+cut with a sync in flight so the last frame landed only in part (at every
+prefix length), an `fsync` that fails, and a write that fails.
+
+Two consequences worth stating plainly:
+
+- **A failed `fsync` is never acknowledged**, and latches `ErrFailed`. There is
+  no honest recovery from it in place: on Linux a failed `fsync` can leave the
+  kernel having already dropped the dirty pages, so a later `fsync` may report
+  success without them ever reaching the disk. Reopen to find out what actually
+  survived.
+- **`SyncInterval` acknowledges before durability**, by design. A power cut
+  costs the commits since the last flush. What survives is always a *prefix* of
+  the commit order — you can lose the tail, never a hole in the middle.
+
 ---
 
 ## Backup
@@ -617,8 +670,14 @@ DS_FULL_SWEEP=1 go test ./...
 go test ./... -fuzz FuzzFrameParsing -fuzztime 60s
 ```
 
-The first takes about 30 seconds; the exhaustive sweep about three minutes and
-belongs in CI.
+The first takes about 30 seconds; the exhaustive sweep about three minutes.
+
+CI runs all of it on Linux, Windows and macOS on every push: the race detector
+with 20 crash-injection rounds everywhere, the exhaustive sweep with 40 rounds
+on Linux and Windows, and five minutes of fuzzing. Windows is in the matrix
+rather than assumed — it has its own file locking, and `syncDir` is a no-op
+there, so it is the platform where the durability story is weakest and the code
+least exercised.
 
 The crash tests are the reason to trust any of this:
 
@@ -630,6 +689,12 @@ The crash tests are the reason to trust any of this:
 - **`TestCrashInjection`** runs a child process committing in a loop, kills it
   with a signal it cannot handle, and verifies that every commit the child had
   acknowledged is still there.
+- **`powerloss_test.go`** does what `TestCrashInjection` cannot. After `SIGKILL`
+  the kernel still owns the page cache and writes it out, so every byte the
+  process wrote reaches the disk whether it was fsynced or not — a build that
+  never called `fsync` at all passes that test. These run the log on a simulated
+  device where only `fsync` makes anything durable, and assert the same
+  contract against a machine that simply stops.
 - **`FuzzFrameParsing`** feeds garbage to the frame reader.
 
 Do not weaken these to make a change land. Without them this is a JSON file with

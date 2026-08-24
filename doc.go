@@ -10,7 +10,10 @@
 //
 // # What it gives you
 //
-//   - Crash durability. A commit is on disk and fsynced before Update returns.
+//   - Power-loss durability. Under SyncAlways a commit is on disk and fsynced
+//     before Update returns, so an acknowledged commit survives the machine
+//     stopping, not merely the process. See powerloss_test.go, which runs the
+//     log on a device where only fsync makes anything durable.
 //   - Real transactions. Several records across several collections commit as
 //     one atomic unit, which is what placing an order actually requires:
 //     write the order, debit the loyalty balance, consume the promo code, and
@@ -43,6 +46,12 @@
 // Recovery loads the newest valid snapshot and replays the log on top of it,
 // stopping at the first frame that is short, fails its checksum, or arrives out
 // of sequence. Compaction folds the log back into a new snapshot.
+//
+// Both are checksummed: every log frame carries a crc32c, and a snapshot is an
+// envelope carrying one over its payload. A snapshot that fails its checksum is
+// passed over for the previous one and reported through
+// RecoveryReport.SnapshotsSkipped. Snapshots written before the envelope
+// existed still load, unverified, and are rewritten at the next compaction.
 //
 // Archived segments are history, never recovery input: their frames are already
 // in the snapshot, so replaying them would apply the same changes twice.
