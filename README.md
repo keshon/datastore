@@ -93,7 +93,7 @@ func main() {
     // 1. Describe the database. This touches no disk at all.
     db := datastore.New(datastore.Options{
         Dir:      "data/main", // the directory this database owns
-        MaxBytes: 64 << 20,    // warn once the dataset outgrows 64 MiB of RAM
+        MaxBytes: 64 << 20,    // warn past 64 MiB of encoded records (not of RAM)
     })
 
     // 2. Declare the collections and indexes BEFORE opening — replaying the log
@@ -325,6 +325,21 @@ enforces nothing — it logs when you cross the threshold and reports `Bytes` an
 `Budget` in `Stats`, which turns "OOM one morning" into a line in a log months
 earlier. `Options.OnCommit` receives a summary of every commit for metrics.
 
+**`MaxBytes` counts encoded records, not memory.** `Stats.Bytes` sums
+`len(key) + len(encoded record)` and nothing else — not the map holding the
+records, not the slice header on each one, and not the indexes. Measured on a
+four-index collection, actual heap is roughly:
+
+```
+heap ≈ payload + records × (90 + 145 × indexes)   bytes
+```
+
+So 100,000 records with four indexes cost about 67 MB of overhead on top of the
+payload. Note the shape: it is a constant per record, not a multiplier, so the
+ratio to `Stats.Bytes` looks alarming for tiny records (7.4× at 127 bytes) and
+unremarkable for realistic ones (1.4× at 2 KB). Run `TestMemoryFootprint` to
+measure it for your own record shape rather than trusting either number.
+
 ## The log as an audit trail
 
 Every commit already records a sequence number and a timestamp. Attach context
@@ -532,7 +547,7 @@ in key order. `TxIndex` and `TxSortedIndex` carry the same `All`.
 | `Logger` | no-op | `*zerolog.Logger` receiving recovery and compaction events. |
 | `Clock` | `time.Now` | Supplies commit timestamps. |
 | `WriteTimeout` | `30s` | How long `Update` waits for the writer slot before returning `ErrWriteTimeout`. |
-| `MaxBytes` | `0` (off) | Size the dataset is expected to stay under. Warns; enforces nothing. |
+| `MaxBytes` | `0` (off) | Encoded size the dataset is expected to stay under — payload, not heap. Warns; enforces nothing. |
 | `WarnAtPercent` | `80` | Fraction of `MaxBytes` that triggers the warning. |
 | `OnCommit` | none | Called with a `CommitStats` after each commit, for metrics. |
 | `HistorySegments` | `0` (off) | Compacted log segments to retain for `History`. |

@@ -72,6 +72,14 @@ type Options struct {
 	// failure mode when it stops fitting is an out-of-memory kill with no
 	// warning beforehand. Setting a budget converts that into a log line months
 	// earlier. Zero disables the check.
+	//
+	// It is measured against Stats.Bytes, which is payload alone: len(key) plus
+	// len(encoded record), summed. Nothing structural is counted — not the map
+	// holding the records, not the slice header on each one, and not the
+	// indexes, which are the larger share. Measured, the heap actually used is
+	// about payload + records×(90 + 145×indexes) bytes, so a budget meant as a
+	// memory limit should be set well below the memory available.
+	// TestMemoryFootprint measures it for a given record shape.
 	MaxBytes int64
 
 	// WarnAtPercent is the fraction of MaxBytes that triggers the warning.

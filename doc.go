@@ -5,8 +5,9 @@
 // specific assumption: the whole dataset fits comfortably in RAM — a few
 // hundred kilobytes today, perhaps twenty megabytes in a decade. Set
 // Options.MaxBytes and the store will tell you long before that assumption
-// stops holding. When it does, export: the on-disk format is plain JSON
-// precisely so that stays easy.
+// stops holding; note that it counts encoded records rather than heap, and see
+// its documentation for the difference. When the assumption does stop holding,
+// export: the on-disk format is plain JSON precisely so that stays easy.
 //
 // # What it gives you
 //
