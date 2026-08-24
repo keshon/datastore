@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -228,16 +229,19 @@ func TestMemoryFootprint(t *testing.T) {
 		t.Skip("memory measurement is slow; run without -short")
 	}
 
-	t.Logf("%-9s %-8s %12s %12s %10s %8s", "records", "indexes", "payload", "heap", "B/record", "factor")
+	t.Logf("%-9s %-8s %-8s %12s %12s %10s %8s",
+		"records", "indexes", "recsize", "payload", "heap", "B/record", "factor")
 	for _, n := range []int{2000, 10000} {
 		for _, withIndexes := range []bool{false, true} {
-			payload, heap := measureFootprint(t, n, withIndexes)
-			factor := float64(heap) / float64(payload)
-			t.Logf("%-9d %-8v %12d %12d %10.1f %7.1fx",
-				n, withIndexes, payload, heap, float64(heap)/float64(n), factor)
+			for _, pad := range []int{0, 400, 2000} {
+				payload, heap := measureFootprint(t, n, withIndexes, pad)
+				factor := float64(heap) / float64(payload)
+				t.Logf("%-9d %-8v %-8d %12d %12d %10.1f %7.1fx",
+					n, withIndexes, int(payload)/n, payload, heap, float64(heap)/float64(n), factor)
 
-			if factor < 1 {
-				t.Errorf("heap (%d) below payload (%d): the measurement is wrong", heap, payload)
+				if factor < 1 {
+					t.Errorf("heap (%d) below payload (%d): the measurement is wrong", heap, payload)
+				}
 			}
 		}
 	}
@@ -245,7 +249,7 @@ func TestMemoryFootprint(t *testing.T) {
 
 // measureFootprint reports Stats().Bytes and the live heap the database
 // occupies, for n records.
-func measureFootprint(tb testing.TB, n int, withIndexes bool) (payload, heap int64) {
+func measureFootprint(tb testing.TB, n int, withIndexes bool, pad int) (payload, heap int64) {
 	tb.Helper()
 
 	settle := func() uint64 {
@@ -285,6 +289,9 @@ func measureFootprint(tb testing.TB, n int, withIndexes bool) (payload, heap int
 			o.Email = fmt.Sprintf("user%d@example.com", i)
 			o.Tags = []string{"retail", "web"}
 			o.Created = int64(i)
+			if pad > 0 {
+				o.Customer = strings.Repeat("x", pad)
+			}
 			if err := oc.Put(o); err != nil {
 				return err
 			}
