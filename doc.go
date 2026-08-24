@@ -32,8 +32,9 @@
 // # What it deliberately does not give you
 //
 // No query language, no joins, no key range scans, no MVCC, no replication, and
-// no multi-process writing. Declare an index or write a Go loop; at these
-// volumes a linear scan is measured in microseconds.
+// no multi-process writing. Declare an index or write a Go loop; a scan costs
+// roughly 2us per record, nearly all of it the decode that makes every result a
+// fresh copy. Use an index once that matters.
 //
 // # Layout on disk
 //

@@ -157,7 +157,8 @@ func main() {
         fmt.Println(o.Num, o.Total)
     }
 
-    // Or just loop: at these volumes a linear scan is microseconds.
+    // Or just loop: a scan costs about 2 us per record, so a few hundred
+    // records is microseconds and ten thousand is roughly 20 ms.
     total := 0
     for o := range orders.All() {
         total += o.Total
@@ -432,8 +433,10 @@ application keeps running.
 ## What it does not do
 
 No query language, no joins, no key range scans, no MVCC, no replication, and no
-multi-process *writing*. Declare an index or write a Go loop — at these volumes a
-linear scan is measured in microseconds.
+multi-process *writing*. Declare an index or write a Go loop. A scan costs about
+2 us per record, nearly all of it the decode that makes every result a fresh
+copy — microseconds for a few hundred records, about 20 ms for ten thousand. Use
+an index once that matters.
 
 It assumes **the whole dataset fits comfortably in RAM**. That assumption is what
 justifies deleting most of what a database normally does. When it stops holding,
