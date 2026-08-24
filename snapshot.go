@@ -23,6 +23,24 @@ var snapshotRe = regexp.MustCompile(`^snapshot-(\d{12})\.json$`)
 // original format: a bare snapshotFile with no checksum.
 const snapshotFormatVersion = 1
 
+// downgradeTrap is a deliberate type conflict, and the reason it is spelled
+// "collections" rather than something tidier.
+//
+// A build older than the envelope decodes a snapshot straight into
+// snapshotFile. Handed an envelope it finds none of the fields it knows,
+// succeeds anyway, and opens an empty database -- no error, no warning, and
+// the log was emptied by the compaction that wrote the snapshot. Silent total
+// loss on a downgrade.
+//
+// Those builds expect collections to be an object. Giving them a string makes
+// json.Unmarshal fail, which routes into the path they already have for a
+// damaged snapshot: warn, skip, and report it through
+// RecoveryReport.SnapshotsSkipped, so LostData is true and somebody is told.
+// The database is still empty, but loudly rather than silently, and the string
+// says what to do about it.
+const downgradeTrap = "this snapshot needs datastore v1.4 or newer; upgrade, " +
+	"or restore the backup you took before downgrading"
+
 func snapshotName(seq uint64) string {
 	return fmt.Sprintf("snapshot-%012d.json", seq)
 }
@@ -93,8 +111,14 @@ func listSnapshots(dir string) ([]uint64, error) {
 // were summed are the bytes that land on disk.
 func wrapSnapshot(payload []byte) []byte {
 	var buf bytes.Buffer
-	buf.Grow(len(payload) + 64)
-	buf.WriteString(`{"v":`)
+	buf.Grow(len(payload) + len(downgradeTrap) + 96)
+	buf.WriteString(`{"collections":`)
+	trap, err := json.Marshal(downgradeTrap)
+	if err != nil {
+		panic("datastore: encoding a constant string failed: " + err.Error())
+	}
+	buf.Write(trap)
+	buf.WriteString(`,"v":`)
 	buf.WriteString(strconv.Itoa(snapshotFormatVersion))
 	buf.WriteString(`,"crc32c":`)
 	buf.WriteString(strconv.FormatUint(uint64(crc32.Checksum(payload, crcTable)), 10))

@@ -234,7 +234,10 @@ func TestSnapshotFromNewerBuildIsRefused(t *testing.T) {
 		t.Fatalf("marshal payload: %v", err)
 	}
 	future := wrapSnapshot(payload)
-	future = []byte(strings.Replace(string(future), `{"v":1,`, `{"v":99,`, 1))
+	future = []byte(strings.Replace(string(future), `,"v":1,`, `,"v":99,`, 1))
+	if !strings.Contains(string(future), `"v":99`) {
+		t.Fatal("could not forge a future version; wrapSnapshot's layout changed")
+	}
 	if err := os.WriteFile(filepath.Join(dir, snapshotName(9)), future, 0o644); err != nil {
 		t.Fatalf("write future snapshot: %v", err)
 	}
@@ -319,5 +322,41 @@ func TestSnapshotEnvelopeRoundTrip(t *testing.T) {
 		t.Error("decodeSnapshot accepted a payload with a flipped byte")
 	} else if !strings.Contains(err.Error(), "checksum") {
 		t.Errorf("error = %v, want it to blame the checksum", err)
+	}
+}
+
+// TestOlderBuildRefusesNewSnapshot pins the downgrade behaviour.
+//
+// Builds from before the envelope decoded a snapshot straight into
+// snapshotFile. Handed one of ours they must fail rather than succeed with
+// nothing in hand: succeeding means opening an empty database, silently, with
+// the log already emptied by the compaction that wrote the snapshot.
+func TestOlderBuildRefusesNewSnapshot(t *testing.T) {
+	payload, err := json.Marshal(&snapshotFile{
+		Seq: 12,
+		Collections: map[string]map[string]json.RawMessage{
+			"orders": {"1": json.RawMessage(`{"id":"1"}`)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := wrapSnapshot(payload)
+
+	// Exactly what the older loadSnapshot did.
+	var old snapshotFile
+	if err := json.Unmarshal(b, &old); err == nil {
+		t.Fatalf("an older build parsed this snapshot and found %d collections; "+
+			"it must fail instead, or a downgrade empties the database in silence",
+			len(old.Collections))
+	}
+
+	// And this build must be entirely unbothered by the trap.
+	got, err := decodeSnapshot(b)
+	if err != nil {
+		t.Fatalf("decodeSnapshot: %v", err)
+	}
+	if got.Seq != 12 || len(got.Collections["orders"]) != 1 {
+		t.Errorf("seq=%d orders=%d, want 12 and 1", got.Seq, len(got.Collections["orders"]))
 	}
 }

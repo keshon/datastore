@@ -70,6 +70,26 @@ with no error and no way back.
 
 ---
 
+### Upgrading and downgrading
+
+Snapshots written before v1.4 have no envelope. They still load, unverified,
+and the next compaction rewrites them in the checked format. Nothing to run.
+
+**Downgrading below v1.4 is not supported, and the format defends against it.**
+An older build decodes a snapshot straight into its own struct; handed an
+envelope it would find none of the fields it knows, succeed anyway, and open an
+empty database — silently, with the log already emptied by the compaction that
+wrote the snapshot. So the envelope carries a top-level `collections` field
+holding a *string*, where those builds expect an object. The type conflict makes
+their decode fail, which routes into the path they already have for a damaged
+snapshot: warn, skip it, and report it through `RecoveryReport.SnapshotsSkipped`
+so `LostData()` is true. The database still comes up empty, but loudly, and the
+string says what to do.
+
+Take a backup before upgrading if downgrading is a path you want to keep.
+
+---
+
 ## Durability, per database
 
 `Options.Sync` is set per directory, not per write:
