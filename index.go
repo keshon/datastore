@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"fmt"
+	"iter"
 	"sort"
 )
 
@@ -113,6 +114,51 @@ func (i *Index[T]) findLocked(term string) []T {
 }
 
 // Count reports how many records carry the term, without decoding any of them.
+// All iterates every record carrying the term, in key order.
+//
+// Find is the same query returning a slice: it decodes every match before it
+// returns any of them, which for a broad term is most of the cost. This decodes
+// one record per step, so breaking out early stops the work. Prefer it whenever
+// the loop might not run to the end.
+//
+//	for o := range byStatus.All("new") {
+//	    if o.Total > limit {
+//	        return o, nil // the rest is never decoded
+//	    }
+//	}
+//
+// The read lock is held for the whole iteration, so the body must not write.
+func (i *Index[T]) All(term string) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		i.coll.db.mu.RLock()
+		defer i.coll.db.mu.RUnlock()
+		i.iterateLocked(term, yield)
+	}
+}
+
+// iterateLocked yields matches in key order. The caller holds the read lock.
+func (i *Index[T]) iterateLocked(term string, yield func(T) bool) {
+	set := i.byTerm[term]
+	if len(set) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		v, ok := i.coll.getLocked(k)
+		if !ok {
+			continue
+		}
+		if !yield(v) {
+			return
+		}
+	}
+}
+
 func (i *Index[T]) Count(term string) int {
 	i.coll.db.mu.RLock()
 	defer i.coll.db.mu.RUnlock()
@@ -309,6 +355,41 @@ func (s *SortedIndex[T]) rangeLocked(lo, hi int64) []T {
 
 // Asc returns up to limit records in ascending order, skipping offset.
 // A limit of zero means no limit.
+// All iterates records whose key falls in [lo, hi], ascending.
+//
+// The lazy form of Range: entries are decoded one at a time, so a loop that
+// stops early does not pay for the rest of the window. The read lock is held
+// for the whole iteration, so the body must not write.
+func (s *SortedIndex[T]) All(lo, hi int64) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		s.coll.db.mu.RLock()
+		defer s.coll.db.mu.RUnlock()
+		s.iterateLocked(lo, hi, yield)
+	}
+}
+
+// iterateLocked yields the window in ascending order. The caller holds the
+// read lock.
+func (s *SortedIndex[T]) iterateLocked(lo, hi int64, yield func(T) bool) {
+	if lo > hi {
+		return
+	}
+	start := s.search(lo, "")
+	end := s.search(hi+1, "")
+	if hi == 1<<63-1 {
+		end = len(s.entries)
+	}
+	for _, e := range s.entries[start:end] {
+		v, ok := s.coll.getLocked(e.key)
+		if !ok {
+			continue
+		}
+		if !yield(v) {
+			return
+		}
+	}
+}
+
 func (s *SortedIndex[T]) Asc(limit, offset int) []T {
 	s.coll.db.mu.RLock()
 	defer s.coll.db.mu.RUnlock()

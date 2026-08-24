@@ -493,12 +493,31 @@ application rather than beside it.
 
 | Function | Description |
 |---|---|
-| `AddIndex[T](c, name, func(T) []string) *Index[T]` | Multi-valued. `Find(term) []T`, `Count(term) int`, `Terms() []string`. |
+| `AddIndex[T](c, name, func(T) []string) *Index[T]` | Multi-valued. `Find(term) []T`, `All(term) iter.Seq[T]`, `Count(term) int`, `Terms() []string`. |
 | `AddUnique[T](c, name, func(T) string) *UniqueIndex[T]` | At most one record per term. `Get(term) (T, bool)`. A `""` term opts the record out. |
-| `AddSorted[T](c, name, func(T) int64) *SortedIndex[T]` | Ordered by an int64. `Range(lo, hi)`, `Asc(limit, offset)`, `Desc(limit, offset)`, `Len()`. A limit of 0 means no limit. |
+| `AddSorted[T](c, name, func(T) int64) *SortedIndex[T]` | Ordered by an int64. `Range(lo, hi)`, `All(lo, hi) iter.Seq[T]`, `Asc(limit, offset)`, `Desc(limit, offset)`, `Len()`. A limit of 0 means no limit. |
 | `InIndex` / `InUnique` / `InSorted` | Scope an index to a transaction. Required inside `View`; see [Concurrency](#concurrency-what-may-be-called-from-where). |
 
 All three must be declared before `Open`.
+
+**`Find` versus `All`.** Every read decodes, because every result is a fresh
+copy. `Find` decodes the entire result set before returning any of it, so a
+broad term costs the whole set no matter how much of it you wanted. `All`
+decodes one record per step:
+
+```go
+for o := range byStatus.All("new") {
+    if o.Total > limit {
+        return o, nil // the rest is never decoded
+    }
+}
+```
+
+Over 10,000 matches, taking the first ten costs 21 ms and 100,000 allocations
+through `Find`, and 1.4 ms and 99 allocations through `All`. Iterating the whole
+set costs the same either way — the win is entirely in stopping early. What is
+left in that 1.4 ms is sorting the matching keys, which is the price of yielding
+in key order. `TxIndex` and `TxSortedIndex` carry the same `All`.
 
 ### Options
 

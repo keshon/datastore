@@ -587,6 +587,14 @@ func (ti *TxIndex[T]) Find(term string) []T {
 	return out
 }
 
+// All iterates every committed record carrying the term, in key order, decoding
+// one at a time. See Index.All.
+func (ti *TxIndex[T]) All(term string) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		ti.tx.withRead(func() { ti.i.iterateLocked(term, yield) })
+	}
+}
+
 // Count reports how many committed records carry the term.
 func (ti *TxIndex[T]) Count(term string) int {
 	var n int
@@ -644,6 +652,14 @@ func (ts *TxSortedIndex[T]) Range(lo, hi int64) []T {
 	var out []T
 	ts.tx.withRead(func() { out = ts.s.rangeLocked(lo, hi) })
 	return out
+}
+
+// All iterates committed records whose key falls in [lo, hi], ascending,
+// decoding one at a time. See SortedIndex.All.
+func (ts *TxSortedIndex[T]) All(lo, hi int64) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		ts.tx.withRead(func() { ts.s.iterateLocked(lo, hi, yield) })
+	}
 }
 
 // Asc returns up to limit committed records in ascending order, skipping

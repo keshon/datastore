@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -170,5 +171,122 @@ func TestIndexesRebuiltOnReopen(t *testing.T) {
 	}
 	if got := ids(g.byDate.Asc(0, 0)); got != "1" {
 		t.Errorf("sorted index after reopen = %q, want %q", got, "1")
+	}
+}
+
+// --- lazy iteration -------------------------------------------------------
+
+// TestIndexAllMatchesFind: the lazy reader and the slice reader must agree,
+// or one of them is lying about what is in the index.
+func TestIndexAllMatchesFind(t *testing.T) {
+	f := newFixture(t)
+	for i := 0; i < 20; i++ {
+		o := mkOrder(strconv.Itoa(i))
+		o.Status = []string{"new", "paid"}[i%2]
+		o.Created = int64(i)
+		mustPut(t, f.orders, o)
+	}
+
+	for _, term := range []string{"new", "paid", "absent"} {
+		want := f.byStatus.Find(term)
+		var got []*order
+		for o := range f.byStatus.All(term) {
+			got = append(got, o)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("All(%q) yielded %d, Find returned %d", term, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID {
+				t.Errorf("All(%q)[%d] = %s, Find says %s", term, i, got[i].ID, want[i].ID)
+			}
+		}
+	}
+}
+
+// TestIndexAllStopsEarly is the whole point: breaking out must not decode the
+// rest. Counting yields is how that is visible from outside.
+func TestIndexAllStopsEarly(t *testing.T) {
+	f := newFixture(t)
+	for i := 0; i < 50; i++ {
+		mustPut(t, f.orders, mkOrder(strconv.Itoa(i)))
+	}
+
+	seen := 0
+	for range f.byStatus.All("new") {
+		seen++
+		if seen == 3 {
+			break
+		}
+	}
+	if seen != 3 {
+		t.Errorf("iterated %d records after breaking at 3", seen)
+	}
+	if n := len(f.byStatus.Find("new")); n != 50 {
+		t.Errorf("Find returned %d, want all 50: breaking out must not disturb the index", n)
+	}
+}
+
+// TestSortedIndexAllMatchesRange holds the lazy and slice readers of the sorted
+// index to the same answer, including the exclusive upper edge.
+func TestSortedIndexAllMatchesRange(t *testing.T) {
+	f := newFixture(t)
+	for i := 0; i < 20; i++ {
+		o := mkOrder(strconv.Itoa(i))
+		o.Created = int64(i * 10)
+		mustPut(t, f.orders, o)
+	}
+
+	for _, bounds := range [][2]int64{{0, 190}, {50, 120}, {121, 129}, {-5, 5}, {200, 300}} {
+		want := f.byDate.Range(bounds[0], bounds[1])
+		var got []*order
+		for o := range f.byDate.All(bounds[0], bounds[1]) {
+			got = append(got, o)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("All(%d,%d) yielded %d, Range returned %d", bounds[0], bounds[1], len(got), len(want))
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID {
+				t.Errorf("All(%d,%d)[%d] = %s, Range says %s",
+					bounds[0], bounds[1], i, got[i].ID, want[i].ID)
+			}
+		}
+	}
+}
+
+// TestTxIndexAllSeesCommittedState pins the transactional readers to the same
+// rule the slice forms follow: committed state only, own staged writes excluded.
+func TestTxIndexAllSeesCommittedState(t *testing.T) {
+	f := newFixture(t)
+	for i := 0; i < 5; i++ {
+		mustPut(t, f.orders, mkOrder(strconv.Itoa(i)))
+	}
+
+	err := f.db.Update(func(tx *Tx) error {
+		if err := In(tx, f.orders).Put(mkOrder("99")); err != nil {
+			return err
+		}
+		n := 0
+		for range InIndex(tx, f.byStatus).All("new") {
+			n++
+		}
+		if n != 5 {
+			t.Errorf("TxIndex.All yielded %d, want the 5 committed records", n)
+		}
+		d := 0
+		for range InSorted(tx, f.byDate).All(0, 1<<62) {
+			d++
+		}
+		if d != 5 {
+			t.Errorf("TxSortedIndex.All yielded %d, want 5", d)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if n := len(f.byStatus.Find("new")); n != 6 {
+		t.Errorf("after commit Find returned %d, want 6", n)
 	}
 }

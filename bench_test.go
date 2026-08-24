@@ -335,3 +335,53 @@ func fillOrders(tb testing.TB, f *fixture, n int) {
 type atomicCounter struct{ n atomic.Uint64 }
 
 func (c *atomicCounter) next() uint64 { return c.n.Add(1) }
+
+// BenchmarkIndexFindVsAll contrasts the two readers on a broad term.
+//
+// Find decodes every match before returning any, so its cost is the whole
+// result set no matter what the caller wanted. All decodes per step, so a loop
+// that stops early pays for what it read.
+func BenchmarkIndexFindVsAll(b *testing.B) {
+	f := benchFixture(b, func(o *Options) { o.Sync = SyncNever })
+	const n = 10000
+	fillOrders(b, f, n)
+
+	b.Run("Find/all", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if got := len(f.byStatus.Find("new")); got != n {
+				b.Fatalf("got %d", got)
+			}
+		}
+	})
+	b.Run("All/all", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			seen := 0
+			for range f.byStatus.All("new") {
+				seen++
+			}
+			if seen != n {
+				b.Fatalf("got %d", seen)
+			}
+		}
+	})
+	b.Run("Find/first10", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			got := f.byStatus.Find("new")
+			_ = got[:10]
+		}
+	})
+	b.Run("All/first10", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			seen := 0
+			for range f.byStatus.All("new") {
+				if seen++; seen == 10 {
+					break
+				}
+			}
+		}
+	})
+}
