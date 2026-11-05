@@ -1,205 +1,158 @@
 # Internals
 
-The on-disk format, what durability actually guarantees, and the tests that
-hold it to that. Read this before changing anything in the commit path.
+Components, state lifetime, disk format and durability contracts. For operation,
+see [the guide](guide.md); for checks and contribution rules, see
+[conventions](conventions.md).
 
----
+## Components and state ownership
+
+| Component | Owns |
+|---|---|
+| `DB` (`db.go`) | Directory options, collection registry, sequence, counters, lifecycle and background workers |
+| `Collection[T]` (`collection.go`) | JSON-encoded records and collection schema version |
+| Indexes (`index.go`) | Derived in-memory lookup structures and extraction functions |
+| `Tx` (`tx.go`) | Callback-scoped staged writes, deletes, counters and annotations |
+| WAL (`wal.go`) | Framed append-only commit data and file synchronization |
+| Group commit (`groupcommit.go`) | Pending commit window and shared flush coordination |
+| Snapshots (`snapshot.go`) | Complete state encoding, checksum envelope and snapshot installation |
+| Recovery and migration | Snapshot selection, live-log replay, version conversion and recovery report |
+| History and watches | Disk-based audit reads and bounded in-memory event queues |
+
+`New` describes a database without I/O. Collections, indexes and migrations are
+declared before `Open` or `OpenReader`. Writable `Open` holds an exclusive
+process lock until close, restores state, persists migrations by compaction,
+and starts configured background workers. `Close` stops workers and attempts
+compaction before releasing resources. Check its returned error.
+
+Records stay encoded; each read decodes a new value, so changing a returned
+struct cannot mutate stored state or indexes. Indexes are rebuilt when records
+are loaded or replayed. Index extraction must be deterministic for a record.
+
+Transactions stage changes until commit. Collection reads through `In(tx, c)`
+can see staged writes; transaction-scoped index reads use committed indexes.
+There is no MVCC. Unregistered collections and their schema versions are kept
+as opaque records and carried through compaction, allowing a later build to
+register them again without silently deleting their data.
+
+`OpenReader` restores a loaded view without a writer lock, workers or disk
+writes. Migrations happen only in that reader's memory. Later commits do not
+refresh its records; close and reopen to reload. History reads disk separately
+and is not restricted to the reader's loaded sequence.
+
 ## On disk
 
-```
+```text
 dir/
-  LOCK                        exclusive, held for the lifetime of the process
+  LOCK                        exclusive writer lock, held until close
   snapshot-000000000412.json  full state as of sequence 412
-  wal.log                     framed, append-only, everything after that
-  archive-000000000412.log    a past segment, kept only when History is enabled
+  wal.log                     framed live log
+  archive-000000000412.log    retained history segment, if enabled
 ```
 
-A frame is `u32 length | u32 crc32c | JSON payload`. Recovery loads the newest
-snapshot that verifies and replays the log on top, stopping at the first frame
-that is short, fails its checksum, or arrives out of sequence — and truncating
-there. Stopping is the point: once one decision in the log is unreadable, the
-ones after it cannot be trusted to apply to the state we think we have.
+A WAL frame is `u32 length | u32 crc32c | JSON payload`. JSON payloads allow
+record inspection without a separate binary codec, although WAL files include
+binary framing. Snapshots contain records, sequence, counters and schema versions.
+The current snapshot envelope includes a format version, CRC32C over the exact
+payload bytes, the payload, and a top-level downgrade marker named `collections`.
+See [snapshot.go](../snapshot.go) for its exact encoding.
 
-**Snapshots are checksummed too.** A snapshot is an envelope carrying a
-crc32c over the exact payload bytes:
+Recovery loads the newest usable snapshot and replays `wal.log`, skipping
+frames already covered by the snapshot. It stops at a short, corrupt or
+out-of-sequence frame. Writable recovery truncates that tail; read-only recovery
+reports it without changing the files. Inspect `Recovery()` even after a
+successful open.
 
-```json
-{"v":1,"crc32c":2882343476,"payload":{"seq":412,"collections":{...}}}
-```
+A damaged snapshot is skipped and reported. Falling back to an older snapshot
+can lose state if the remaining live log cannot bridge it to the current state;
+retained archives are history only and are not replayed during recovery.
+`LostData()` flags skipped snapshots or a truncated log; it does not quantify
+which acknowledged records were lost. CRC32C detects checksum mismatches;
+it does not provide cryptographic authentication or repair damaged data.
 
-"It parsed as JSON" is not an integrity check — a bit flipped inside a string
-value, or inside a digit, decodes perfectly into the wrong data. Since a
-snapshot holds the whole dataset rather than one transaction's worth of it, an
-unchecked one was the largest unguarded object on disk. A snapshot that fails
-its checksum is passed over in favour of the previous one and reported through
-`RecoveryReport.SnapshotsSkipped`, which makes `LostData()` true.
+### Compaction
 
-Snapshots written before this existed are plain payloads with no envelope. They
-still load, unverified, and the next compaction rewrites them in the checked
-format. A snapshot from a *newer* build fails with `ErrSnapshotVersion` rather
-than falling back, because quietly opening at an older snapshot would serve
-stale state as current.
+Compaction encodes the full dataset, writes a temporary snapshot, syncs the file,
+renames it into place, and syncs the directory on Unix before discarding or
+archiving the covered live log. At least two snapshots are retained. The
+sequence lets replay ignore already-snapshotted frames if a crash leaves both
+snapshot and log. Full snapshot encoding requires additional memory, and state
+application can wait while compaction holds locks.
 
-Compaction writes a new snapshot, fsyncs it, fsyncs the directory, and only then
-truncates the log. A crash between those steps leaves a snapshot plus a log that
-replays cleanly on top of it: wasteful, never wrong. The previous snapshot is
-kept for the same reason. Creating `wal.log` fsyncs the directory as well —
-syncing a file makes its contents durable, not the directory entry naming it.
-
-On Windows `syncDir` is a no-op, because the platform exposes no directory
-fsync. Snapshot installation there relies on NTFS metadata ordering rather than
-an explicit barrier, so the guarantee is weaker than on Unix.
-
-**Payloads are JSON deliberately.** A binary codec would be smaller and faster,
-and at a few writes per minute neither matters — whereas reading the log with
-`less` when something has gone wrong matters a great deal.
-
-**Indexes are never written to disk.** They are rebuilt from the records at
-`Open` in about a millisecond. Persisting them would add a second thing that can
-be corrupt and a second thing to keep in step with the first.
-
-**`Get` returns a freshly decoded copy**, never a shared pointer. That costs
-microseconds and removes this design's worst failure mode: a caller mutating a
-struct it was handed, the change never reaching the log, and the indexes quietly
-disagreeing with the data.
-
-**A collection this build does not register is preserved, not deleted.** Its
-records ride through compaction untouched and reappear when it is registered
-again. Otherwise removing one `Register` call and deploying would drop a table
-with no error and no way back.
-
----
+Windows `syncDir` is a no-op. Snapshot installation therefore lacks the explicit
+directory-sync barrier used on Unix. Atomic rename and file-content sync do not
+establish the same metadata durability guarantee. The process and simulated WAL
+crash tests do not prove every filesystem's power-loss behavior.
 
 ### Upgrading and downgrading
 
-Snapshots written before v1.4 have no envelope. They still load, unverified,
-and the next compaction rewrites them in the checked format. Nothing to run.
+Legacy snapshots without an envelope load without checksum verification; the
+next compaction rewrites them in the checked format. A snapshot with a newer
+format version fails with `ErrSnapshotVersion` rather than falling back to a
+potentially stale snapshot. Collection schema versions are checked separately;
+migrations are described in [the guide](guide.md#schema-changes).
 
-**Downgrading below v1.4 is not supported, and the format defends against it.**
-An older build decodes a snapshot straight into its own struct; handed an
-envelope it would find none of the fields it knows, succeed anyway, and open an
-empty database — silently, with the log already emptied by the compaction that
-wrote the snapshot. So the envelope carries a top-level `collections` field
-holding a *string*, where those builds expect an object. The type conflict makes
-their decode fail, which routes into the path they already have for a damaged
-snapshot: warn, skip it, and report it through `RecoveryReport.SnapshotsSkipped`
-so `LostData()` is true. The database still comes up empty, but loudly, and the
-string says what to do.
+Downgrading below v1.4 is unsupported. Older builds expect top-level
+`collections` to be an object; the current envelope writes a string there to
+force a decoding error instead of silently accepting an empty database. Those
+builds may still skip snapshots and open with missing state, reporting the
+problem through recovery. The marker does not make a downgrade safe. Restore
+a pre-upgrade backup with its compatible binary when rollback is required.
 
-Take a backup before upgrading if downgrading is a path you want to keep.
+## Commit flow
 
----
+1. Acquire the writer slot and run the callback without holding the state lock
+   throughout. Reads that depend on earlier pending commits wait for those
+   commits to be applied.
+2. Encode staged changes and validate uniqueness, including the pending window.
+   Returning a callback error appends nothing.
+3. Append one frame for the nonempty transaction and assign its sequence.
+4. Under `SyncAlways`, enqueue the frame, release the writer slot, flush the
+   pending batch and apply covered frames to memory in sequence order.
+   Acknowledge only after this transaction is flushed and applied.
+5. Under the other sync modes, apply after append without a commit-path flush.
+6. Deliver watch events after application. Commit statistics are reported on
+   the committing goroutine through `OnCommit` when configured.
 
-## Durability, per database
-
-`Options.Sync` is set per directory, not per write:
-
-| Mode | Behaviour | For |
-|---|---|---|
-| `SyncAlways` | fsync before `Update` returns | orders, customers, money |
-| `SyncInterval` | fsync on a timer | sessions, carts — cheap to recreate |
-| `SyncNever` | leave it to the OS | tests |
-
-Run two databases when the workloads differ. Sessions churn orders of magnitude
-more than orders do and would otherwise dominate the log and force constant
-compaction; losing a guest cart on an unclean shutdown is fine, losing an order
-is not.
+The state `RWMutex` protects records, indexes and applied sequence. The writer
+slot serializes transaction bodies and log appends; group-commit coordination
+allows later writers to append while an earlier writer waits for sync.
+Write-only transactions avoid waiting for the pending window to drain on reads.
+Use the [concurrency rules](guide.md#concurrency-what-may-be-called-from-where)
+when combining direct reads, callbacks and iterators.
 
 ### Group commit
 
-Concurrent commits share one fsync. The writer slot is handed back as soon as a
-frame is in the log, so the next transaction runs its body and appends while the
-previous one is still waiting for the disk; whichever writer gets there first
-fsyncs for everybody waiting and applies the batch in sequence order.
+Concurrent `SyncAlways` commits can share a flush. Releasing the writer slot
+before waiting permits batching without publishing unflushed state. Other
+modes do not use this commit-path batching because they do not flush there.
+The batching ratio depends on scheduling and I/O; there is no fixed ratio.
 
-This does not weaken anything above. `Update` still returns only once the commit
-is durable, and a frame becomes *visible* only when it is applied, which happens
-after the fsync that covers it — so a reader can still never see a commit that
-would vanish in a power cut.
+## Durability, per database
 
-Two consequences worth knowing:
+`Options.Sync` applies to the database directory, not individual writes:
 
-- **A transaction that reads waits** for commits already in flight to become
-  durable, so a read-then-write sequence still observes everything before it.
-  Write-only transactions — including `Collection.Put` and `Collection.Delete` —
-  never wait. That is the shape that scales.
-- **Only `SyncAlways` batches.** The other modes never fsync on the commit path,
-  so there is nothing to amortise.
+| Mode | Acknowledgment and visibility | Power-loss exposure |
+|---|---|---|
+| `SyncAlways` | After the covering WAL sync and memory application | Acknowledged writes depend on successful sync, storage honoring it and supported snapshot installation semantics |
+| `SyncInterval` | After append and memory application; background sync defaults to every 5 seconds | Unflushed tail can be lost; the timer is not a hard loss bound |
+| `SyncNever` | After append and memory application; no periodic WAL flush | No acknowledgment-time power-loss guarantee |
 
-`TestGroupCommitSharesOneFsync` pins the behaviour by counting fsyncs rather
-than by timing anything: 320 concurrent commits cost 79 fsyncs, about 4 commits
-per flush. Counting is deterministic, and a wall-clock assertion on a shared CI
-runner would not be.
+`SyncAlways` is the default. A process kill leaves OS caches alive, so surviving
+that test alone does not establish machine power-loss durability. Separate
+process-crash and simulated-device tests exercise those different failure models.
+The Windows snapshot limitation described above remains relevant in every mode.
 
-### What `SyncAlways` guarantees
-
-**If `Update` returned `nil`, the commit survives the machine losing power.**
-Not just the process dying — the machine. That distinction is the whole point,
-and it is tested rather than argued: `powerloss_test.go` runs the log on a
-device that keeps what a process can read separate from what is actually on the
-platter, where only `fsync` moves bytes between them.
-
-The tests cover a power cut at an arbitrary moment under concurrent writers, a
-cut with a sync in flight so the last frame landed only in part (at every
-prefix length), an `fsync` that fails, and a write that fails.
-
-Two consequences worth stating plainly:
-
-- **A failed `fsync` is never acknowledged**, and latches `ErrFailed`. There is
-  no honest recovery from it in place: on Linux a failed `fsync` can leave the
-  kernel having already dropped the dirty pages, so a later `fsync` may report
-  success without them ever reaching the disk. Reopen to find out what actually
-  survived.
-- **`SyncInterval` acknowledges before durability**, by design. A power cut
-  costs the commits since the last flush. What survives is always a *prefix* of
-  the commit order — you can lose the tail, never a hole in the middle.
-
----
+A WAL write or sync failure latches a failed state and later writes return
+`ErrFailed`; a successful retry of sync cannot establish what survived the
+original failure. Close and reopen to recover and inspect the recovery report.
+An error during application of an already-durable frame also latches failure:
+state and log may disagree, and subsequent recovery may fail on that frame.
 
 ## Tests
 
-```bash
-go test ./... -race
-```
-
-```bash
-DS_FULL_SWEEP=1 go test ./...
-```
-
-```bash
-go test ./... -fuzz FuzzFrameParsing -fuzztime 60s
-```
-
-The first takes about 30 seconds; the exhaustive sweep about three minutes.
-
-CI runs all of it on Linux, Windows and macOS on every push: the race detector
-with 20 crash-injection rounds everywhere, the exhaustive sweep with 40 rounds
-on Linux and Windows, and five minutes of fuzzing. Windows is in the matrix
-rather than assumed — it has its own file locking, and `syncDir` is a no-op
-there, so it is the platform where the durability story is weakest and the code
-least exercised.
-
-The crash tests are the reason to trust any of this:
-
-- **`TestRecoveryFromTruncatedLog`** cuts the log short at many offsets —
-  concentrated at frame boundaries, every single byte under `DS_FULL_SWEEP=1` —
-  and at each one asserts that the recovered state equals *exactly* the prefix
-  of commits the store claims it applied, that the count never decreases as the
-  cut moves later, and that every index matches a brute-force recomputation.
-- **`TestCrashInjection`** runs a child process committing in a loop, kills it
-  with a signal it cannot handle, and verifies that every commit the child had
-  acknowledged is still there.
-- **`powerloss_test.go`** does what `TestCrashInjection` cannot. After `SIGKILL`
-  the kernel still owns the page cache and writes it out, so every byte the
-  process wrote reaches the disk whether it was fsynced or not — a build that
-  never called `fsync` at all passes that test. These run the log on a simulated
-  device where only `fsync` makes anything durable, and assert the same
-  contract against a machine that simply stops.
-- **`FuzzFrameParsing`** feeds garbage to the frame reader.
-
-Do not weaken these to make a change land. Without them this is a JSON file with
-extra steps.
-
-`dstest` has the boilerplate for consumers' tests: `dstest.New(t)` gives an
-unopened database in a temp directory configured for speed, and `dstest.Open(t,
-db)` opens it and arranges for `Verify` plus `Close` when the test ends.
+[Test commands, CI coverage and relevant contracts](conventions.md) are maintained
+in the contributor guide. The simulated power-loss tests model volatile versus
+durable WAL bytes, torn writes, sync failures and concurrent commits. Process
+crash tests check acknowledged writes after killing a child process. Snapshot
+checksums, fallback, migrations and restored backups have separate tests.
+Neither suite replaces restore verification for an actual deployment.

@@ -1,7 +1,9 @@
-# Guide
+# Running and using datastore
 
-Everything past the [quickstart](../README.md#quickstart): the parts of the
-package you reach for once it is holding real data.
+Setup, configuration and operation for applications embedding datastore. Start
+with the [README quickstart](../README.md#quickstart). Requirements follow
+[`go.mod`](../go.mod), which declares Go 1.25.0. Install with
+`go get github.com/keshon/datastore` from your application module.
 
 For the on-disk format, the durability guarantees and how they are tested, see
 [internals.md](internals.md). For the full API, see
@@ -9,21 +11,94 @@ For the on-disk format, the durability guarantees and how they are tested, see
 
 ## Contents
 
-- [The transaction that justifies the package](#the-transaction-that-justifies-the-package)
+- [Setup and configuration](#setup-and-configuration)
+- [Collections and indexes](#collections-and-indexes)
+- [Transactions](#transactions)
 - [Concurrency: what may be called from where](#concurrency-what-may-be-called-from-where)
 - [Schema changes](#schema-changes)
 - [Knowing when something went wrong](#knowing-when-something-went-wrong)
+- [Capacity and observability](#capacity-and-observability)
 - [The log as an audit trail](#the-log-as-an-audit-trail)
 - [Watching for changes](#watching-for-changes)
 - [Reading from a second process](#reading-from-a-second-process)
 - [Backup](#backup)
 
----
-## The transaction that justifies the package
+## Setup and configuration
 
-Placing an order writes the order, debits a loyalty balance, consumes a promo
-code and queues a confirmation email. Either all of that happened or none of it
-did:
+Create a database with `New`, declare collections, indexes and migrations, then
+call `Open`. `New` performs no I/O. `Open` creates the directory if needed,
+takes its exclusive writer lock, loads a snapshot and replays the live log.
+Check `Recovery()` after opening an existing store, and check the error from
+`Close()` during application shutdown. Writable close attempts a final compaction.
+
+Use a dedicated persistent `Options.Dir`. Collections, counters, schema versions,
+snapshots and the log belong to that directory. Indexes are rebuilt in memory;
+index declarations and migration code remain part of the application.
+
+[`Options` and its defaults](../db.go) are the source of truth:
+
+| Option | Default | Behavior |
+|---|---|---|
+| `Dir` | Required | Directory owned by this database |
+| `Sync` | `SyncAlways` | Flush before acknowledgment; see [durability](internals.md#durability-per-database) |
+| `SyncEvery` | 5 seconds | Flush interval for `SyncInterval` |
+| `CompactAfterBytes` | 8 MiB | WAL size threshold for compaction |
+| `CompactInterval` | 15 minutes | Periodic compaction; `CompactNever` disables this timer only |
+| `KeepSnapshots` | 2, also the minimum | Number of snapshots retained |
+| `Logger` | No-op logger | Recovery, compaction and budget messages |
+| `Clock` | `time.Now` | Commit timestamps |
+| `WriteTimeout` | 30 seconds | Wait limit for the writer slot, not callback execution |
+| `MaxBytes` | Disabled | Encoded payload budget; does not reject writes |
+| `WarnAtPercent` | 80 | Percentage of `MaxBytes` that triggers a warning |
+| `OnCommit` | `nil` | Commit callback on the committing goroutine |
+| `HistorySegments` / `HistoryFor` | Both disabled | Retained compacted WAL segments by count and age |
+
+Zero or negative values select defaults for `SyncEvery`, `CompactAfterBytes`
+and `WriteTimeout`. A negative `CompactInterval` disables its timer; zero
+selects the default. Size-triggered and close-time compaction still run.
+Both enabled history bounds apply; zero disables that particular bound.
+
+## Collections and indexes
+
+Records implement `Key() string` and must round-trip through JSON. Keep keys
+stable and unique within a collection. Declare indexes before opening:
+
+```go
+orders := datastore.Register[*Order](db, "orders")
+byCustomer := datastore.AddIndex(orders, "customer",
+    func(o *Order) []string { return []string{o.Customer} })
+byEmail := datastore.AddUnique(orders, "email",
+    func(o *Order) string { return o.Email })
+byDate := datastore.AddSorted(orders, "date",
+    func(o *Order) int64 { return o.Created.Unix() })
+```
+
+`AddIndex` maps each term to multiple records; `AddUnique` permits one record
+per nonempty term, with an empty term opting out; `AddSorted` orders by `int64`.
+Index functions must be deterministic for a record and must not call back into
+the database. The [orders example](../examples/orders/main.go) shows all three.
+
+Direct reads return freshly decoded copies:
+
+```go
+o, ok := orders.Get("1")
+list := byCustomer.Find("cust-7")
+o, ok = byEmail.Get("buyer@example.com")
+recent := byDate.Desc(10, 0)
+```
+
+`Find` decodes the complete matching set. `All` decodes one record per step,
+so breaking early avoids decoding the remaining matches. Iterators still hold
+read locks; follow the [concurrency rules](#concurrency-what-may-be-called-from-where).
+For complete signatures, use the
+[API reference](https://pkg.go.dev/github.com/keshon/datastore).
+
+---
+## Transactions
+
+This transaction writes an order and debits a loyalty balance atomically. The
+fragment assumes the application has declared `orders`, `customers` and its
+domain errors:
 
 ```go
 err := db.Update(func(tx *datastore.Tx) error {
@@ -50,33 +125,35 @@ err := db.Update(func(tx *datastore.Tx) error {
 })
 ```
 
-One log frame, one fsync. Returning an error from the function rolls everything
-back and writes nothing.
+A nonempty transaction is encoded as one log frame. Under `SyncAlways`, it is
+flushed before acknowledgment; concurrent commits may share that flush.
+Returning an error from the callback discards its staged changes and writes
+nothing.
 
-Read *inside* the transaction, through `In(tx, c)`, when the write depends on
-what you read. `Get` outside `Update` followed by `Put` inside it is a
-lost-update waiting to happen: the writer lock serialises the writes, not your
-read-then-write pair.
+Read inside the transaction, through `In(tx, c)`, when the write depends on
+what you read. A separate `Get` followed by `Update` can overwrite a concurrent
+change: the writer slot serializes transaction bodies, not the earlier read.
 
 Queue outbound email *inside* the transaction as a record, and send it from a
-worker outside. Then a crash after commit still sends the mail, and an SMTP
-failure never rolls back an order.
+worker outside. An SMTP failure then leaves the committed order intact. Retry
+pending records after restart and account for duplicate delivery if the process
+crashes after sending but before marking the record complete.
 
-Do not call `Update` from inside `Update`. It can never proceed — the slot it
-waits for is the one it already holds — so it is detected and panics immediately
-with an explanation rather than deadlocking.
+Do not call `Update` or direct `Collection.Put` / `Delete` from inside `Update`.
+They attempt to acquire the writer slot already held by that callback. The
+runtime attempts to detect same-goroutine reentry and panic immediately; the
+writer timeout remains a fallback. Use `In(tx, c)` for writes inside a callback.
 
 ---
 
 ## Concurrency: what may be called from where
 
-One writer at a time; readers never block each other. `Update` runs your
-function *without* holding the state lock, so a transaction's body and its fsync
-never block readers — only the brief moment where an already-durable commit is
-applied to memory.
+One transaction body runs at a time. `Update` does not hold the state lock
+throughout the callback or WAL sync. Applying changes, compaction and other
+operations that take the state write lock can block readers. `View` holds a
+read lock throughout its callback; keep it short and avoid I/O.
 
-That leaves one rule worth knowing, because getting it wrong hangs rather than
-errors:
+Use transaction-scoped reads inside callbacks:
 
 | Where you are | Read with | Not with |
 |---|---|---|
@@ -86,10 +163,9 @@ errors:
 `View` holds the read lock for its whole callback, and the direct methods take
 that lock again. Go's `sync.RWMutex` is not reentrant: a second `RLock` with a
 writer queued in between deadlocks. The `In*` wrappers know the lock is already
-held, which is what makes them safe in both contexts — use them and the
-distinction never bites you.
+held and avoid reacquiring it in `View`.
 
-Two smaller ones:
+Iterator and staged-state rules:
 
 - `Collection.All()` holds the read lock for the whole iteration, so its body
   must not write. Collect keys first, then write after the loop.
@@ -101,10 +177,13 @@ Two smaller ones:
 
 ## Schema changes
 
-Adding a field needs nothing: JSON decoding fills it with the zero value.
-Migrations are for the changes decoding cannot guess — a renamed field, a
-changed unit, a struct split in two — where the old records are still valid JSON
-but no longer mean what the new code thinks.
+Adding a field generally needs no migration when its zero value is acceptable.
+Use migrations for renamed fields, changed units or other transformations of
+existing records. Each registered transform changes one record's raw JSON;
+cross-collection restructuring requires an application-level procedure.
+
+This example upgrades version 1 records to version 2. Unversioned collections
+start at version 0; supply every step from the oldest version still on disk:
 
 ```go
 users := datastore.Register[*User](db, "users", datastore.SchemaVersion(2))
@@ -122,88 +201,82 @@ datastore.Migrate(users, 1, func(raw json.RawMessage) (json.RawMessage, error) {
 })
 ```
 
-A migration takes raw JSON and returns raw JSON, because the Go type it has to
-read no longer exists in this build. That is unpleasant to write and it is the
-honest signature; the alternative is a museum of old structs compiled in
-forever.
+Migrations take and return raw JSON so they can read old field layouts without
+requiring the old Go types in the application. Back up an existing deployment
+before opening it with a new schema version; verify the result on a separate
+copy first. Retain the old binary and its pre-migration backup for rollback.
 
 At `Open`, records below the declared version are carried up one step at a time
 — snapshot rows and log frames alike — and the database is compacted before
 `Open` returns, so the log never holds a mix of versions and the work is not
-repeated on the next start. Opening data written by a *newer* build fails
-instead of guessing.
+repeated on the next start. A collection schema version newer than the one
+declared by the application fails to open. `OpenReader` applies migrations only
+in memory and does not compact.
 
 ---
 
 ## Knowing when something went wrong
 
-Recovery will discard a damaged log tail in order to open at all. That is the
-right trade, but it means a successful `Open` is not proof that nothing was
-lost. Ask:
+Writable recovery can discard a damaged log tail, and snapshot fallback can
+restore an older state. A successful `Open` alone does not establish that no
+data was lost. Inspect the report:
 
 ```go
 if rep := db.Recovery(); rep.LostData() {
     log.Error().
-        Str("reason", rep.TruncatedReason).
-        Int64("at", rep.TruncatedAt).
-        Msg("datastore lost committed work")
+        Interface("recovery", rep).
+        Msg("datastore recovery reported possible data loss")
 }
 ```
 
-`LostData()` is the question to page someone about. `Clean()` is stricter —
-nothing skipped, truncated, *or migrated* — so it is false after a routine
-schema bump; treat it as "the disk was exactly what this build expected", not as
-an alarm.
+The logging fragment uses zerolog's package logger. `LostData()` is true for
+skipped snapshots or a truncated log; it cannot identify exactly which
+acknowledged records were lost. Investigate the full report before accepting
+new work. `Clean()` also requires no migrations, so it is false after a routine
+schema upgrade without necessarily indicating data loss.
 
 `db.Verify()` rebuilds every index from the records and reports disagreements.
-The indexes are derived state maintained incrementally, and nothing else ever
-checks them against their source; run this in CI or behind an admin command.
+Run it in application tests or behind an admin command when checking integrity.
 `dstest.Open` runs it automatically when a test finishes.
 
 If a log write ever fails, the store latches that failure and every later write
-returns `ErrFailed`. The log may hold a torn frame at that point, and anything
-written after it would be discarded by the next replay — so refusing is what
-keeps "`Update` returned nil" meaning "this survives a crash". Reopen to
-recover whatever the log still holds.
+returns `ErrFailed`. The log may hold a torn frame, so appending more data could
+put acknowledged writes after a frame recovery cannot read. Sync failures also
+latch failure. Close and reopen, inspect recovery and verify application state
+before resuming service. Preserve a copy of the affected files for investigation.
 
-Set `Options.MaxBytes` to the size the dataset is expected to stay under. It
-enforces nothing — it logs when you cross the threshold and reports `Bytes` and
-`Budget` in `Stats`, which turns "OOM one morning" into a line in a log months
-earlier. `Options.OnCommit` receives a summary of every commit for metrics.
+## Capacity and observability
 
-**`MaxBytes` counts encoded records, not memory.** `Stats.Bytes` sums
-`len(key) + len(encoded record)` and nothing else — not the map holding the
-records, not the slice header on each one, and not the indexes. Measured on a
-four-index collection, actual heap is roughly:
+`Options.MaxBytes` is an advisory budget, not a memory limit. A warning is emitted
+on crossing `MaxBytes * WarnAtPercent / 100`; the percentage defaults to 80.
+Supply `Options.Logger` to receive messages: the default logger discards them.
+`Stats()` reports `Bytes` and `Budget` whether or not logging is configured.
 
-```
-heap ≈ payload + records × (90 + 145 × indexes)   bytes
-```
+`Stats.Bytes` sums key lengths and encoded record lengths. It excludes maps,
+index structures, temporary decoded values and snapshot encoding buffers.
+Compaction encodes the complete dataset, so allow additional memory during
+snapshots. Measure your own record and index shapes with `TestMemoryFootprint`;
+[historical estimates](internal/measurements.md) are not a heap budget.
 
-So 100,000 records with four indexes cost about 67 MB of overhead on top of the
-payload. Note the shape: it is a constant per record, not a multiplier, so the
-ratio to `Stats.Bytes` looks alarming for tiny records (7.4× at 127 bytes) and
-unremarkable for realistic ones (1.4× at 2 KB). Run `TestMemoryFootprint` to
-measure it for your own record shape rather than trusting either number.
+`Options.OnCommit` runs on the committing goroutine. Keep it short and do not
+access the database from it; record metrics and return.
 
 ---
 
 ## The log as an audit trail
 
-Every commit already records a sequence number and a timestamp. Attach context
-to it and you have an audit trail from data the store was writing anyway:
+Each nonempty commit records a sequence number and timestamp. Add annotations
+with `Tx.Note` and inspect them with `History`:
 
 ```go
-db.Update(func(tx *datastore.Tx) error {
+err := db.Update(func(tx *datastore.Tx) error {
     tx.Note("actor", "user:7")
     tx.Note("reason", "refund")
     return datastore.In(tx, orders).Put(o)
 })
 ```
 
-Read it back with `History`, which reports each commit's annotations — the
-`Meta` map is exactly what `Note` put there — *and the values as they were
-written*, something the current state cannot tell you:
+`History` supplies annotations in `Meta` and record values as originally written:
 
 ```go
 err := db.History(0, 0, func(e datastore.HistoryEntry) error {
@@ -216,14 +289,14 @@ err := db.History(0, 0, func(e datastore.HistoryEntry) error {
 })
 ```
 
-**How far back it reaches is a retention choice.** By default compaction
+History availability depends on retention. By default compaction
 discards the log, so only commits since the last compaction are visible. Set
 either bound to keep segments instead:
 
 ```go
 datastore.Options{
     HistorySegments: 20,                  // keep the newest 20 compacted segments
-    HistoryFor:      30 * 24 * time.Hour, // ...and nothing older than 30 days
+    HistoryFor:      30 * 24 * time.Hour, // prune older segments by file modification time
 }
 ```
 
@@ -232,9 +305,9 @@ emptying it. Archives are history only — their frames are already in the
 snapshot, so recovery never replays them, and deleting one costs you history,
 never state. `Stats` reports `ArchiveSegments` and `ArchiveBytes`.
 
-A damaged archive returns `ErrCorruptFrame` rather than reading as a shorter
-history: an audit trail with an invisible hole is worse than an error. A torn
-tail on the *live* log is a normal crash artifact and simply ends the scan.
+A damaged archive returns `ErrCorruptFrame`. A torn tail on the live log ends
+the scan. Retention age uses segment file modification time and is enforced
+when pruning runs, not as an exact per-entry expiry. Handle the returned error.
 
 ---
 
@@ -252,29 +325,47 @@ for ev := range sub.Events() {
 }
 ```
 
-Events are delivered after the change is both durable and applied, so a
-subscriber that reads the database on receipt sees it, and they arrive in commit
-order. Each subscriber gets its own copy of `Value` and `Meta`.
+Events are delivered in commit order after changes are applied to memory.
+Under `SyncAlways`, the covering flush has also completed. Under `SyncInterval`
+or `SyncNever`, event delivery is not evidence of power-loss durability. A
+subsequent read sees the applied change or a later update to that record.
+Each subscriber gets its own copy of `Value` and `Meta`.
 
-**A subscriber can never slow a commit down.** Delivery is best-effort into a
-bounded queue; a subscriber that stops reading has events dropped and is told how
-many, rather than blocking an fsync. A dropped event is a nuisance, a blocked
-write is an outage.
+Delivery does not wait for the subscriber to consume events. It is best-effort
+into a bounded queue; when the queue fills, events are dropped. Inspect
+`Event.Dropped` and `Subscription.Dropped()`. After a drop, reread the relevant
+current state or rebuild from retained history if it covers the missing range.
 
-`Watch` does not replay the past — but it records the sequence it started at, so
-catching up is a composition rather than a feature:
+`Watch` does not replay history. Subscribe first, replay retained history up to
+the starting sequence, then consume the queue:
 
 ```go
 sub := db.Watch(datastore.WatchOptions{}) // events start queueing here
 defer sub.Close()
 
-db.History(0, sub.StartSeq(), func(e datastore.HistoryEntry) error { ... }) // the past
-for ev := range sub.Events() { ... }                                        // then live
+if start := sub.StartSeq(); start > 0 { // History's upper bound 0 means unbounded
+    if err := db.History(0, start, func(e datastore.HistoryEntry) error {
+        // Apply the historical entry to the consumer's state.
+        return nil
+    }); err != nil {
+        return err
+    }
+}
+for ev := range sub.Events() {
+    if ev.Dropped > 0 {
+        // Rebuild the consumer's state before continuing.
+    }
+    // Apply the live change.
+}
 ```
 
-Subscribing *first* is what closes the gap: everything up to `StartSeq` comes
-from `History`, everything after it from the feed, with nothing missed and
-nothing delivered twice.
+Subscribing first divides history and live events at `StartSeq`. This works
+only while the required history is retained and the subscription queue does
+not overflow during replay. Choose `WatchOptions.Buffer` for the expected
+backlog and detect drops. History scans disk files without pinning retention;
+coordinate compaction and pruning if the consumer requires a complete audit
+sequence. The [catch-up test](../catchup_test.go) exercises a bounded workload
+with retained history and a queue large enough for all live events.
 
 ---
 
@@ -286,6 +377,7 @@ Only one process may *own* a directory. A second one can still read it:
 db := datastore.New(datastore.Options{Dir: dir})
 orders := datastore.Register[*Order](db, "orders")
 if err := db.OpenReader(); err != nil { ... }
+defer db.Close()
 ```
 
 `OpenReader` takes no lock and never writes — not the log header, not a
@@ -294,16 +386,39 @@ through `Recovery` instead of repaired, because the log belongs to whoever holds
 the lock). The view is a point in time; reopen to see later commits. Every write
 returns `ErrReadOnly`.
 
-That is what a CLI, an inspector or a backup job should use while the
-application keeps running.
+Use this for a CLI, inspector or backup job that needs the loaded state while
+the writer keeps running. It does not pin a history-retention boundary.
 
 ---
 
 ## Backup
 
-`db.Backup(dst)` writes a self-contained directory you can point `Options.Dir`
-at. Restoring is copying it back — there is no restore command because there is
-nothing to do.
+`db.Backup(dst)` writes a self-contained snapshot of current state, including
+counters, schema versions and unregistered collections. It does not copy the
+live WAL or archived audit history. It holds the database read lock while
+writing the snapshot, so applying commits can wait for backup I/O.
 
-Test the restore on a scratch host before relying on it. An untested backup is a
-hypothesis.
+From the application or a read-only inspection program, pass a new, empty
+destination distinct from the active database directory and check the returned
+error. Reusing an existing database directory can leave unrelated snapshots
+beside the backup; `Backup` is not a directory-cleaning operation. Never point
+it at the active directory.
+
+To validate or restore:
+
+1. Copy the backup to a fresh scratch directory. With the intended application
+   version and collection declarations, open that directory, inspect
+   `Recovery()`, run `Verify()`, and check application-level records and counters.
+   A writable open may migrate and compact the copy, so keep the original
+   backup untouched. Check the close error.
+2. Stop the application owning the destination database and confirm its close
+   completed. Preserve its existing directory separately for rollback.
+3. Copy the validated backup into a fresh destination, or configure
+   `Options.Dir` to point at the restored directory. Do not merge its files with
+   an existing database: a newer leftover snapshot or WAL can change recovery.
+4. Start the application, inspect recovery, verify indexes and check the expected
+   application state before resuming writes. To roll back, stop it again and
+   restore the preserved directory together with a compatible application binary.
+
+For an inspector using `OpenReader`, the backup reflects that reader's loaded
+state. Reopen the reader if a later point in time is required.
