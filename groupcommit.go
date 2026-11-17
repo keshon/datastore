@@ -55,6 +55,10 @@ type groupState struct {
 	// pending holds appended-but-unapplied frames in sequence order.
 	pending []*pendingFrame
 
+	// flushing remains visible to constraint checks until the batch is applied.
+	flushing []*pendingFrame
+	bytes    int64 // encoded frames in pending and flushing, guarded by mu
+
 	// syncing reports that a leader is mid-flush. Followers wait rather than
 	// starting a second fsync, which would be pure contention.
 	syncing bool
@@ -73,8 +77,35 @@ func (db *DB) enqueue(frame *walFrame) *pendingFrame {
 	pf := &pendingFrame{frame: frame}
 	db.group.mu.Lock()
 	db.group.pending = append(db.group.pending, pf)
+	db.group.bytes += int64(frame.encodedSize)
 	db.group.mu.Unlock()
 	return pf
+}
+
+// The writer slot prevents another enqueue while this caller waits. Flushing
+// does not need that slot, so waiting cannot prevent the window from draining.
+func (db *DB) waitPendingCapacity(size int64) error {
+	limit := db.opts.MaxPendingBytes
+	if limit <= 0 {
+		return nil
+	}
+	if size > limit {
+		return fmt.Errorf("%w: WAL frame bytes %d exceed pending limit %d", ErrTransactionTooLarge, size, limit)
+	}
+	g := db.group
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for g.bytes > limit-size {
+		if g.syncing {
+			g.cond.Wait()
+			continue
+		}
+		err := db.flushLocked()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // awaitDurable blocks until pf is durable and applied, or until the attempt
@@ -130,27 +161,34 @@ func (db *DB) flushLocked() error {
 
 	batch := g.pending
 	g.pending = nil
+	g.flushing = batch
 	g.syncing = true
 	g.mu.Unlock()
 
 	// One fsync for the whole batch. It flushes the file, so it also covers
 	// anything appended since the snapshot above; those frames are simply
 	// applied by the next flush, which costs nothing and is never wrong.
-	err := db.wal.sync()
+	err := db.failedErr()
 	applied := 0
-	if err != nil {
-		// A failed fsync means durability is unknown from here on: the kernel
-		// may have dropped the dirty pages, and a later sync can report success
-		// without them. Nothing in the batch is applied, and every writer in it
-		// is told so.
-		db.fail(fmt.Errorf("group sync: %w", err))
-	} else {
+	if err == nil {
+		err = db.wal.sync()
+		if err != nil {
+			// A failed fsync means durability is unknown from here on: the kernel
+			// may have dropped the dirty pages, and a later sync can report success
+			// without them. Nothing in the batch is applied, and every writer in it
+			// is told so.
+			db.fail(fmt.Errorf("group sync: %w", err))
+		}
+	}
+	if err == nil {
 		applied, err = db.applyBatch(batch)
 	}
 
 	g.mu.Lock()
+	g.flushing = nil
 	g.syncing = false
 	for i, pf := range batch {
+		g.bytes -= int64(pf.frame.encodedSize)
 		pf.settled = true
 		if i < applied {
 			pf.err = nil // this one made it, whatever happened after
@@ -208,28 +246,35 @@ func (db *DB) pendingOpsFor(coll string) (puts map[string]json.RawMessage, dels 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	for _, pf := range g.pending {
-		for _, op := range pf.frame.Ops {
-			if op.Coll != coll {
+	for _, batch := range [2][]*pendingFrame{g.flushing, g.pending} {
+		for _, pf := range batch {
+			// The caller holds the state read lock. A flushed batch can remain
+			// registered during watch dispatch after its records are already applied.
+			if pf.frame.Seq <= db.seq {
 				continue
 			}
-			if op.Op == opDelete {
-				if puts != nil {
-					delete(puts, op.Key)
+			for _, op := range pf.frame.Ops {
+				if op.Coll != coll {
+					continue
 				}
-				if dels == nil {
-					dels = make(map[string]struct{})
+				if op.Op == opDelete {
+					if puts != nil {
+						delete(puts, op.Key)
+					}
+					if dels == nil {
+						dels = make(map[string]struct{})
+					}
+					dels[op.Key] = struct{}{}
+					continue
 				}
-				dels[op.Key] = struct{}{}
-				continue
+				if dels != nil {
+					delete(dels, op.Key)
+				}
+				if puts == nil {
+					puts = make(map[string]json.RawMessage)
+				}
+				puts[op.Key] = op.Val
 			}
-			if dels != nil {
-				delete(dels, op.Key)
-			}
-			if puts == nil {
-				puts = make(map[string]json.RawMessage)
-			}
-			puts[op.Key] = op.Val
 		}
 	}
 	return puts, dels

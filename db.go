@@ -76,11 +76,23 @@ type Options struct {
 	// It is measured against Stats.Bytes, which is payload alone: len(key) plus
 	// len(encoded record), summed. Nothing structural is counted — not the map
 	// holding the records, not the slice header on each one, and not the
-	// indexes, which are the larger share. Measured, the heap actually used is
-	// about payload + records×(90 + 145×indexes) bytes, so a budget meant as a
-	// memory limit should be set well below the memory available.
-	// TestMemoryFootprint measures it for a given record shape.
+	// indexes. Set this budget below the available memory and measure the actual
+	// record and index shape with TestMemoryFootprint or the opt-in TestCapacity.
 	MaxBytes int64
+
+	// MaxTransactionBytes bounds staged record keys and JSON payloads, including
+	// collection names per operation. Replacing a staged key adjusts its cost.
+	// It excludes counters, annotations and JSON framing. Zero means unlimited.
+	MaxTransactionBytes int64
+
+	// MaxTransactionOps bounds distinct staged collection/key pairs. Repeated
+	// puts or deletes of the same key count once. Zero means unlimited.
+	MaxTransactionOps int
+
+	// MaxPendingBytes bounds encoded WAL frames awaiting settlement under
+	// SyncAlways, including the flushing batch. Writers wait for space before
+	// appending; a single larger frame is rejected. Zero means unlimited.
+	MaxPendingBytes int64
 
 	// WarnAtPercent is the fraction of MaxBytes that triggers the warning.
 	// Default 80.
@@ -152,7 +164,8 @@ type DB struct {
 
 	// mu guards the in-memory state: records, indexes, sequence, counters.
 	// Held briefly — for a read, or to apply an already-durable commit.
-	mu sync.RWMutex
+	mu      sync.RWMutex
+	closeMu sync.Mutex // serializes Close, including retries after writer timeout
 
 	// writeCh serialises writers. A transaction runs without holding mu, so
 	// readers are not blocked while it works or while its frame is fsynced.
@@ -171,7 +184,8 @@ type DB struct {
 	// They are carried through compaction untouched. Without that, commenting
 	// out a Register call and deploying would silently delete a table at the
 	// next compaction — a failure with no error, no log line, and no way back.
-	orphans map[string]map[string]json.RawMessage
+	orphans     map[string]map[string]json.RawMessage
+	orphanBytes int64
 
 	// orphanVersions remembers the schema version each orphan was written at, so
 	// re-registering the collection later migrates from the right version rather
@@ -203,7 +217,8 @@ type DB struct {
 	// package's own tests. The crash-injection tests swap in a device that can
 	// lose power, which is the only way to distinguish bytes that were written
 	// from bytes that were made durable.
-	openLog logOpener
+	openLog      logOpener
+	saveSnapshot func(string, *snapshotFile) error // snapshot I/O boundary, replaced only in tests
 
 	opened   bool
 	closed   bool
@@ -215,10 +230,11 @@ type DB struct {
 	// replay while this process kept acknowledging commits. See ErrFailed.
 	failed error
 
-	stop        chan struct{}
-	wg          sync.WaitGroup
-	lastCompact time.Time
-	unsynced    bool
+	stop                chan struct{}
+	wg                  sync.WaitGroup
+	lastCompact         time.Time
+	lastCompactDuration time.Duration
+	unsynced            bool
 
 	// overBudget tracks whether the budget warning has already been given, so a
 	// dataset sitting at the threshold does not log on every commit.
@@ -250,6 +266,7 @@ func New(opts Options) *DB {
 		counters:       make(map[string]uint64),
 		stop:           make(chan struct{}),
 		openLog:        osLogOpener,
+		saveSnapshot:   writeSnapshot,
 		group:          newGroupState(),
 	}
 }
@@ -338,6 +355,18 @@ func (db *DB) restoreLocked() error {
 	for _, w := range warnings {
 		db.log.Warn().Str("dir", db.opts.Dir).Msg("snapshot_skipped: " + w)
 	}
+	db.seq = 0
+	db.counters = make(map[string]uint64)
+	db.orphans = make(map[string]map[string]json.RawMessage)
+	db.orphanVersions = make(map[string]int)
+	db.orphanBytes = 0
+	for name, coll := range db.colls {
+		n := 0
+		if snap != nil {
+			n = len(snap.Collections[name])
+		}
+		coll.beginRestore(n)
+	}
 
 	rep := RecoveryReport{SnapshotsSkipped: warnings}
 
@@ -375,6 +404,9 @@ func (db *DB) restoreLocked() error {
 			coll, known := db.colls[name]
 			if !known {
 				db.orphans[name] = rows
+				for key, raw := range rows {
+					db.orphanBytes += int64(len(key) + len(raw))
+				}
 				if v := snap.Versions[name]; v > 0 {
 					db.orphanVersions[name] = v
 				}
@@ -423,6 +455,9 @@ func (db *DB) restoreLocked() error {
 			Uint64("last_seq", db.seq).
 			Str("reason", res.Reason).
 			Msg("wal_truncated")
+	}
+	for _, coll := range db.colls {
+		coll.endRestore()
 	}
 
 	// Nothing is in flight after recovery, so the two sequences agree again.
@@ -475,10 +510,15 @@ func (db *DB) applyFrameLocked(fr *walFrame) error {
 				rows = make(map[string]json.RawMessage)
 				db.orphans[op.Coll] = rows
 			}
+			old, exists := rows[op.Key]
+			if exists {
+				db.orphanBytes -= int64(len(op.Key) + len(old))
+			}
 			if op.Op == opDelete {
 				delete(rows, op.Key)
 			} else {
 				rows[op.Key] = op.Val
+				db.orphanBytes += int64(len(op.Key) + len(op.Val))
 			}
 			continue
 		}
@@ -558,25 +598,43 @@ func (db *DB) compactLoop() {
 // Dir returns the directory this database owns.
 func (db *DB) Dir() string { return db.opts.Dir }
 
-// Close stops background work, compacts, and releases the lock.
+// Close stops background work, compacts, and releases the lock. A writer timeout
+// retains resources and refuses new updates; retry Close after the writer exits.
 func (db *DB) Close() error {
+	db.closeMu.Lock()
+	defer db.closeMu.Unlock()
+
 	db.mu.Lock()
-	if !db.opened || db.closed {
+	if !db.opened {
 		db.mu.Unlock()
 		return nil
 	}
+	startClosing := !db.closed
 	db.closed = true
 	readOnly := db.readOnly
 	db.mu.Unlock()
 
-	close(db.stop)
+	if startClosing {
+		close(db.stop)
+	}
 	db.wg.Wait()
 	db.closeSubscriptions()
 
-	// A reader owns nothing on disk: no compaction, no lock to release.
-	var err error
+	// A timeout must leave resources intact for the active writer. A later
+	// Close retries cleanup; updates remain refused while closing.
+	err := db.acquireWriter()
+	if err != nil {
+		return err
+	}
+	defer db.releaseWriter()
 	if !readOnly {
-		err = db.Compact()
+		err = db.drainPending()
+		if err == nil {
+			err = db.failedErr()
+		}
+		if err == nil {
+			err = db.compactExclusive()
+		}
 	}
 
 	db.mu.Lock()
@@ -631,6 +689,10 @@ func (db *DB) Compact() error {
 	if err := db.drainPending(); err != nil {
 		return err
 	}
+	err := db.failedErr()
+	if err != nil {
+		return err
+	}
 	return db.compactExclusive()
 }
 
@@ -640,13 +702,60 @@ func (db *DB) Compact() error {
 // that replays cleanly on top of it — wasteful, never wrong. The other order
 // loses everything since the last snapshot.
 func (db *DB) compactExclusive() error {
+	started := time.Now()
+	db.mu.RLock()
+	if db.wal == nil {
+		db.mu.RUnlock()
+		return ErrNotOpen
+	}
+	snap := db.snapshotLocked()
+	db.mu.RUnlock()
+
+	// The writer slot keeps records stable. Readers can proceed during encoding,
+	// file sync and installation; none of that needs the state lock.
+	err := db.saveSnapshot(db.opts.Dir, snap)
+	if err != nil {
+		return err
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.wal == nil {
-		return ErrNotOpen
+	// Only discard the log after installing the covering snapshot.
+	if db.archivingEnabled() {
+		err = db.archiveLogLocked(db.seq)
+	} else {
+		err = db.wal.reset()
+		if err != nil && db.failed == nil {
+			// Reset may have truncated the old log before failing. Appending
+			// after its partial header would make later acknowledgments unsafe.
+			db.failed = fmt.Errorf("reset log after compaction: %w", err)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	err = pruneSnapshots(db.opts.Dir, db.opts.KeepSnapshots)
+	if err != nil {
+		return err
+	}
+	if db.archivingEnabled() {
+		err = db.pruneArchives(db.opts.Clock())
+		if err != nil {
+			return err
+		}
 	}
 
+	db.lastCompact = db.opts.Clock()
+	db.lastCompactDuration = time.Since(started)
+	db.unsynced = false
+	db.log.Info().Uint64("seq", db.seq).Msg("datastore_compacted")
+	return nil
+}
+
+// snapshotLocked borrows immutable record bytes. The writer slot must remain
+// held until encoding finishes, and pending commits must already be drained.
+func (db *DB) snapshotLocked() *snapshotFile {
 	snap := &snapshotFile{
 		Seq:         db.seq,
 		TS:          db.opts.Clock().Unix(),
@@ -670,31 +779,7 @@ func (db *DB) compactExclusive() error {
 		}
 	}
 
-	if err := writeSnapshot(db.opts.Dir, snap); err != nil {
-		return err
-	}
-	// The snapshot is durable, so the log's contents are now redundant for
-	// recovery: either empty it, or keep it aside as history.
-	if db.archivingEnabled() {
-		if err := db.archiveLogLocked(db.seq); err != nil {
-			return err
-		}
-	} else if err := db.wal.reset(); err != nil {
-		return err
-	}
-	if err := pruneSnapshots(db.opts.Dir, db.opts.KeepSnapshots); err != nil {
-		return err
-	}
-	if db.archivingEnabled() {
-		if err := db.pruneArchives(db.opts.Clock()); err != nil {
-			return err
-		}
-	}
-
-	db.lastCompact = db.opts.Clock()
-	db.unsynced = false
-	db.log.Info().Uint64("seq", db.seq).Msg("datastore_compacted")
-	return nil
+	return snap
 }
 
 // Backup writes a self-contained copy into dst, which is created if needed.
@@ -702,41 +787,42 @@ func (db *DB) compactExclusive() error {
 // The result is a directory you can point Options.Dir at. Restoring is copying
 // it back — there is no restore command because there is nothing to do.
 func (db *DB) Backup(dst string) error {
-	if err := os.MkdirAll(dst, 0o755); err != nil {
+	err := os.MkdirAll(dst, 0o755)
+	if err != nil {
 		return fmt.Errorf("datastore: create %s: %w", dst, err)
+	}
+	source, err := os.Stat(db.opts.Dir)
+	if err != nil {
+		return err
+	}
+	target, err := os.Stat(dst)
+	if err != nil {
+		return err
+	}
+	if os.SameFile(source, target) {
+		return fmt.Errorf("datastore: backup destination is the database directory")
+	}
+
+	err = db.acquireWriter()
+	if err != nil {
+		return err
+	}
+	defer db.releaseWriter()
+	err = db.drainPending()
+	if err != nil {
+		return err
 	}
 
 	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	if !db.opened {
+	if !db.opened || db.closed {
+		db.mu.RUnlock()
 		return ErrNotOpen
 	}
+	snap := db.snapshotLocked()
+	db.mu.RUnlock()
 
-	snap := &snapshotFile{
-		Seq:         db.seq,
-		TS:          db.opts.Clock().Unix(),
-		Counters:    make(map[string]uint64, len(db.counters)),
-		Versions:    make(map[string]int, len(db.colls)),
-		Collections: make(map[string]map[string]json.RawMessage, len(db.colls)+len(db.orphans)),
-	}
-	for k, v := range db.counters {
-		snap.Counters[k] = v
-	}
-	for name, coll := range db.colls {
-		snap.Collections[name] = coll.dump()
-		if v := coll.schemaVersion(); v > 0 {
-			snap.Versions[name] = v
-		}
-	}
-	for name, rows := range db.orphans {
-		snap.Collections[name] = rows
-		if v := db.orphanVersions[name]; v > 0 {
-			snap.Versions[name] = v
-		}
-	}
-
-	if err := writeSnapshot(dst, snap); err != nil {
+	err = db.saveSnapshot(dst, snap)
+	if err != nil {
 		return err
 	}
 	// No log is copied: the snapshot already contains every committed change,
@@ -772,26 +858,27 @@ func (db *DB) checkBudgetLocked() {
 }
 
 func (db *DB) bytesLocked() int64 {
-	var total int64
+	total := db.orphanBytes
 	for _, coll := range db.colls {
 		total += int64(coll.bytes())
-	}
-	for _, rows := range db.orphans {
-		for k, v := range rows {
-			total += int64(len(k) + len(v))
-		}
 	}
 	return total
 }
 
 // Stats is a point-in-time summary, for an admin screen or a health check.
 type Stats struct {
-	Seq         uint64
-	Collections map[string]int
-	Orphans     map[string]int
-	Counters    map[string]uint64
-	WALBytes    int64
-	LastCompact time.Time
+	Seq                 uint64
+	Collections         map[string]int
+	Orphans             map[string]int
+	Counters            map[string]uint64
+	WALBytes            int64
+	LastCompact         time.Time
+	LastCompactDuration time.Duration
+
+	// PendingBytes and PendingFrames include the flushing batch until its
+	// callers are settled. These describe the group-commit memory window.
+	PendingBytes  int64
+	PendingFrames int
 
 	// Bytes is the encoded size of every record held in memory, and Budget is
 	// Options.MaxBytes (0 when unset). Watch the ratio: this design assumes the
@@ -810,11 +897,12 @@ func (db *DB) Stats() Stats {
 	db.mu.RLock()
 
 	s := Stats{
-		Seq:         db.seq,
-		Collections: make(map[string]int, len(db.colls)),
-		Orphans:     make(map[string]int, len(db.orphans)),
-		Counters:    make(map[string]uint64, len(db.counters)),
-		LastCompact: db.lastCompact,
+		Seq:                 db.seq,
+		Collections:         make(map[string]int, len(db.colls)),
+		Orphans:             make(map[string]int, len(db.orphans)),
+		Counters:            make(map[string]uint64, len(db.counters)),
+		LastCompact:         db.lastCompact,
+		LastCompactDuration: db.lastCompactDuration,
 	}
 	for name, coll := range db.colls {
 		s.Collections[name] = coll.count()
@@ -830,6 +918,10 @@ func (db *DB) Stats() Stats {
 	}
 	s.Bytes = db.bytesLocked()
 	s.Budget = db.opts.MaxBytes
+	db.group.mu.Lock()
+	s.PendingBytes = db.group.bytes
+	s.PendingFrames = len(db.group.pending) + len(db.group.flushing)
+	db.group.mu.Unlock()
 	db.mu.RUnlock()
 
 	// Archive stats walk the directory. Filesystem work has no business under

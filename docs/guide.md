@@ -30,6 +30,9 @@ call `Open`. `New` performs no I/O. `Open` creates the directory if needed,
 takes its exclusive writer lock, loads a snapshot and replays the live log.
 Check `Recovery()` after opening an existing store, and check the error from
 `Close()` during application shutdown. Writable close attempts a final compaction.
+If close returns `ErrWriteTimeout`, the active writer still owns its resources;
+the database refuses new updates, and `Close` can be retried after that writer
+finishes. Do not remove the directory or start another owner before cleanup succeeds.
 
 Use a dedicated persistent `Options.Dir`. Collections, counters, schema versions,
 snapshots and the log belong to that directory. Indexes are rebuilt in memory;
@@ -57,6 +60,20 @@ Zero or negative values select defaults for `SyncEvery`, `CompactAfterBytes`
 and `WriteTimeout`. A negative `CompactInterval` disables its timer; zero
 selects the default. Size-triggered and close-time compaction still run.
 Both enabled history bounds apply; zero disables that particular bound.
+
+For bounded ingestion, `MaxTransactionOps` limits distinct staged collection/key
+pairs, and `MaxTransactionBytes` limits their encoded keys, collection names and
+JSON values. Replacing a staged key adjusts its existing cost. Both default to
+unlimited. A rejected `Put` or `Delete` returns `ErrTransactionTooLarge`; return
+that error from the callback to abandon the whole transaction. Metadata, counters
+and JSON framing are excluded; the WAL still enforces its separate frame limit.
+
+Under `SyncAlways`, `MaxPendingBytes` bounds encoded frames waiting for group
+commit to settle, including the flushing batch. A writer waits before appending
+if the next frame would exceed the bound. A frame larger than the entire bound
+returns `ErrTransactionTooLarge` without appending. The default is unlimited;
+other sync modes have no group-commit window and ignore this option. These
+bounds do not cap the heap used by application values, JSON encoding or indexes.
 
 ## Collections and indexes
 
@@ -253,9 +270,25 @@ Supply `Options.Logger` to receive messages: the default logger discards them.
 `Stats()` reports `Bytes` and `Budget` whether or not logging is configured.
 
 `Stats.Bytes` sums key lengths and encoded record lengths. It excludes maps,
-index structures, temporary decoded values and snapshot encoding buffers.
-Compaction encodes the complete dataset, so allow additional memory during
-snapshots. Measure your own record and index shapes with `TestMemoryFootprint`;
+index structures and temporary decoded values. Payload accounting is incremental;
+checking the budget does not scan the records after each commit. Snapshots stream
+record bytes and checksums, with bounded output buffers and a sorted key list per
+collection. Writers wait during compaction; readers can proceed during snapshot
+encoding and I/O, but can still wait during log reset or rotation.
+
+`Stats.PendingBytes` and `PendingFrames` include the current flushing batch until
+settlement. `LastCompactDuration` measures the most recent successful compaction
+after acquiring the writer slot; it excludes time queued for that slot.
+
+For large datasets, tune `CompactAfterBytes` to the workload. The default 8 MiB
+threshold is intended for small stores; using it for a gigabyte-scale import
+repeatedly writes the growing full snapshot. Batch ingestion into bounded
+transactions and measure with the production sync mode. Startup sorts the final
+sorted-index entries once; changing a sorted term during ordinary writes still
+shifts a slice and costs O(records). Reads still decode independent copies.
+
+Measure your own record and index shapes with `TestMemoryFootprint` and the
+opt-in `TestCapacity` described in the contributor guide;
 [historical estimates](internal/measurements.md) are not a heap budget.
 
 `Options.OnCommit` runs on the committing goroutine. Keep it short and do not
@@ -395,14 +428,17 @@ the writer keeps running. It does not pin a history-retention boundary.
 
 `db.Backup(dst)` writes a self-contained snapshot of current state, including
 counters, schema versions and unregistered collections. It does not copy the
-live WAL or archived audit history. It holds the database read lock while
-writing the snapshot, so applying commits can wait for backup I/O.
+live WAL or archived audit history. It acquires the writer slot, drains earlier
+pending commits and streams a stable snapshot. Updates wait for backup I/O;
+readers can proceed. The loaded view of an `OpenReader` remains fixed, so its
+backup represents that loaded view.
 
 From the application or a read-only inspection program, pass a new, empty
 destination distinct from the active database directory and check the returned
 error. Reusing an existing database directory can leave unrelated snapshots
 beside the backup; `Backup` is not a directory-cleaning operation. Never point
-it at the active directory.
+it at the active directory; that destination is explicitly rejected, including
+aliases identified by the filesystem as the same directory.
 
 To validate or restore:
 

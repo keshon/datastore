@@ -11,8 +11,8 @@ through a write-ahead log and snapshots.
 
 The default `SyncAlways` mode flushes commits before `Update` returns successfully.
 Concurrent commits can share a flush. Power-loss recovery depends on the
-filesystem and storage honoring sync; Windows snapshot installation has no
-explicit directory-sync barrier. See the
+filesystem and storage honoring sync. Windows snapshot installation requests
+write-through but has no explicit directory-sync barrier. See the
 [durability contract](docs/internals.md#durability-per-database).
 
 ## When to use it
@@ -25,8 +25,9 @@ recovery reports, retained audit history and a best-effort change feed.
 There is no SQL, joins, MVCC, replication or multi-process writing. One process
 owns the directory for writing; another can load a
 [read-only view](docs/guide.md#reading-from-a-second-process). Reads return fresh
-copies. Indexes are rebuilt at startup, and compaction needs additional memory
-to encode the dataset. Measure capacity with your own records and indexes.
+copies. Indexes are rebuilt at startup. Compaction streams the snapshot while
+writers wait; readers can proceed during snapshot encoding and I/O. Measure
+capacity with your own records and indexes.
 
 ## Install
 
@@ -120,6 +121,8 @@ That example uses a temporary database and removes it when finished.
   and methods; source declarations define defaults and contracts.
 - [Historical measurements](docs/internal/measurements.md) — previously published
   estimates and commands for measuring the current implementation.
+- [GEKTOR storage assessment, 2026-11-13](docs/internal/2026-11-13-gektor-storage-assessment.md)
+  — reproduced concurrent unique-index defect and application fit assessment.
 
 ## License
 

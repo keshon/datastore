@@ -261,18 +261,27 @@ func (w *wal) writeHeader() error {
 // An error from encodeFrame leaves the log untouched; an error from append does
 // not, which is why only the latter poisons the database (see DB.commit).
 func encodeFrame(fr *walFrame) ([]byte, error) {
-	payload, err := json.Marshal(fr)
+	estimate := frameHeaderSize + 128
+	for _, op := range fr.Ops {
+		estimate += len(op.Coll) + len(op.Key) + len(op.Val) + 64
+	}
+	storage := make([]byte, frameHeaderSize, estimate)
+	encoded := bytes.NewBuffer(storage)
+	encoder := json.NewEncoder(encoded)
+	err := encoder.Encode(fr)
 	if err != nil {
 		return nil, fmt.Errorf("datastore: encode frame: %w", err)
 	}
+	// Encoder adds a newline. Exclude it to preserve the existing frame bytes.
+	buf := encoded.Bytes()
+	buf = buf[:len(buf)-1]
+	payload := buf[frameHeaderSize:]
 	if len(payload) > maxFrameSize {
 		return nil, fmt.Errorf("datastore: frame of %d bytes exceeds the %d limit", len(payload), maxFrameSize)
 	}
 
-	buf := make([]byte, frameHeaderSize+len(payload))
 	binary.LittleEndian.PutUint32(buf[0:], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(buf[4:], crc32.Checksum(payload, crcTable))
-	copy(buf[frameHeaderSize:], payload)
 	fr.encodedSize = len(buf)
 	return buf, nil
 }
@@ -352,6 +361,7 @@ func scanFrames(path string, strict bool, fn func(*walFrame) error) error {
 	}
 	r := bufio.NewReaderSize(f, 1<<16)
 	head := make([]byte, frameHeaderSize)
+	var payload []byte
 
 	for {
 		if _, err := io.ReadFull(r, head); err != nil {
@@ -368,7 +378,11 @@ func scanFrames(path string, strict bool, fn func(*walFrame) error) error {
 		if length == 0 || length > maxFrameSize {
 			return damaged(fmt.Sprintf("implausible frame length %d", length))
 		}
-		payload := make([]byte, length)
+		if uint32(cap(payload)) < length {
+			payload = make([]byte, length)
+		} else {
+			payload = payload[:length]
+		}
 		if _, err := io.ReadFull(r, payload); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return damaged("torn frame payload")
@@ -421,6 +435,7 @@ func (w *wal) replay(minSeq uint64, fn func(*walFrame) error) (replayResult, err
 	offset := int64(walHeaderSize)
 	lastSeq := minSeq
 	head := make([]byte, frameHeaderSize)
+	var payload []byte
 
 	for {
 		if _, err := io.ReadFull(r, head); err != nil {
@@ -438,7 +453,11 @@ func (w *wal) replay(minSeq uint64, fn func(*walFrame) error) (replayResult, err
 			break
 		}
 
-		payload := make([]byte, length)
+		if uint32(cap(payload)) < length {
+			payload = make([]byte, length)
+		} else {
+			payload = payload[:length]
+		}
 		if _, err := io.ReadFull(r, payload); err != nil {
 			res.Truncated, res.Reason = true, "incomplete frame payload"
 			break

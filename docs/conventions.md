@@ -42,6 +42,27 @@ For performance and heap measurements, see the commands in
 [historical measurements](internal/measurements.md#reproduce-with-current-fixtures).
 Do not turn one machine's timings into correctness assertions.
 
+The capacity probe is opt-in and writes roughly a gigabyte at one million records.
+It uses four indexes, about 1 KiB per record, `SyncAlways`, 1,000-record ingest
+transactions and disabled size-triggered compaction during the import:
+
+```powershell
+$env:DS_CAPACITY_RECORDS = '100000' # repeat separately with 1000000
+go test -run '^TestCapacity$' -count=1 -v -timeout=15m .
+Remove-Item Env:DS_CAPACITY_RECORDS
+```
+
+It reports ingest, compaction, reopen, overwrite latency, allocation totals, GC
+cycles and heap after forced GC. Heap figures are retained live heap, not sampled
+peak memory or an enforceable limit. Read the fixture before comparing workloads.
+`BenchmarkSnapshotLarge`, `BenchmarkBudgetOverwrite` and
+`BenchmarkEncodeFrameLarge` isolate snapshot, budget and WAL encoding costs.
+
+`TestTransactionsAgainstModel` compares deterministic random transactions against
+an independent map model, including rejection, rollback, indexes, byte accounting,
+compaction and WAL-only recovery. Deterministic group tests pause real WAL sync
+to cover flushing/pending uniqueness, failed batches and admission backpressure.
+
 ## CI coverage
 
 The source of truth is [ci.yml](../.github/workflows/ci.yml). It runs on pushes

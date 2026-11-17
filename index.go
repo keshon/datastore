@@ -3,13 +3,11 @@ package datastore
 import (
 	"fmt"
 	"iter"
+	"slices"
 	"sort"
 )
 
-// Indexes are never written to disk. They are rebuilt from the records as the
-// snapshot and log are applied, which at these volumes takes about a
-// millisecond. Persisting them would add a second thing that can be corrupt,
-// and a second thing to keep in step with the first, for no gain.
+// Indexes are derived from records and rebuilt during recovery, never persisted.
 
 func mustBeUnopened(db *DB, what string) {
 	if db.opened {
@@ -49,6 +47,10 @@ func AddIndex[T Entity](c *Collection[T], name string, terms func(T) []string) *
 
 func (i *Index[T]) add(key string, v T) {
 	terms := i.terms(v)
+	if slices.Equal(terms, i.byKey[key]) {
+		return
+	}
+	i.remove(key)
 	if len(terms) == 0 {
 		return
 	}
@@ -216,6 +218,10 @@ func AddUnique[T Entity](c *Collection[T], name string, term func(T) string) *Un
 
 func (u *UniqueIndex[T]) add(key string, v T) {
 	t := u.term(v)
+	if old, exists := u.byKey[key]; exists && old == t {
+		return
+	}
+	u.remove(key)
 	if t == "" {
 		return
 	}
@@ -264,16 +270,16 @@ type sortedEntry struct {
 // price, a numeric id.
 //
 // Entries live in one sorted slice, maintained by binary insertion. That is
-// O(n) per write because of the shift, which is the right trade at a few
-// hundred records and a handful of writes a minute; a tree would be more code
-// and more ways to be subtly wrong.
+// O(n) when an indexed value changes because of the shift. Unchanged values
+// stay in place; recovery accumulates the final entries and sorts once.
 type SortedIndex[T Entity] struct {
 	coll *Collection[T]
 	name string
 	key  func(T) int64
 
-	entries []sortedEntry
-	byKey   map[string]int64
+	entries    []sortedEntry
+	byKey      map[string]int64
+	rebuilding bool // restore accumulates final terms, then sorts once
 }
 
 // AddSorted declares a sorted index. Must be called before Open.
@@ -301,6 +307,14 @@ func (s *SortedIndex[T]) search(n int64, key string) int {
 
 func (s *SortedIndex[T]) add(key string, v T) {
 	n := s.key(v)
+	if s.rebuilding {
+		s.byKey[key] = n
+		return
+	}
+	if old, exists := s.byKey[key]; exists && old == n {
+		return
+	}
+	s.remove(key)
 	pos := s.search(n, key)
 	s.entries = append(s.entries, sortedEntry{})
 	copy(s.entries[pos+1:], s.entries[pos:])
@@ -309,12 +323,19 @@ func (s *SortedIndex[T]) add(key string, v T) {
 }
 
 func (s *SortedIndex[T]) remove(key string) {
+	if s.rebuilding {
+		delete(s.byKey, key)
+		return
+	}
 	n, ok := s.byKey[key]
 	if !ok {
 		return
 	}
 	if pos := s.search(n, key); pos < len(s.entries) && s.entries[pos].key == key {
-		s.entries = append(s.entries[:pos], s.entries[pos+1:]...)
+		copy(s.entries[pos:], s.entries[pos+1:])
+		last := len(s.entries) - 1
+		s.entries[last] = sortedEntry{} // release the removed key's backing string
+		s.entries = s.entries[:last]
 	}
 	delete(s.byKey, key)
 }

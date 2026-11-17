@@ -20,6 +20,29 @@ func recvEvent(t *testing.T, sub *Subscription) Event {
 	}
 }
 
+func TestWatchIgnoresDispatchFromBeforeItsBoundary(t *testing.T) {
+	f := newFixture(t)
+	mustPut(t, f.orders, &order{ID: "past"})
+	sub := f.db.Watch(WatchOptions{})
+	defer sub.Close()
+	// Application precedes dispatch. A subscriber created in between already
+	// includes this frame in its history boundary and must not receive it again.
+	f.db.dispatch(&walFrame{
+		Seq: sub.StartSeq(),
+		Ops: []walOp{{Coll: "orders", Key: "past", Op: opPut, Val: json.RawMessage(`{"id":"past"}`)}},
+	})
+	select {
+	case ev := <-sub.Events():
+		t.Fatalf("past event crossed subscription boundary: %+v", ev)
+	default:
+	}
+	mustPut(t, f.orders, &order{ID: "future"})
+	ev := recvEvent(t, sub)
+	if ev.Key != "future" || ev.Seq != sub.StartSeq()+1 {
+		t.Fatalf("later commit missing from live feed: %+v", ev)
+	}
+}
+
 func TestWatchDeliversPutsAndDeletes(t *testing.T) {
 	f := newFixture(t)
 	sub := f.db.Watch(WatchOptions{})

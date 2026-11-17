@@ -19,8 +19,9 @@ type anyCollection interface {
 	collName() string
 	applyPut(key string, raw json.RawMessage) error
 	applyDelete(key string)
-	checkUnique(puts map[string]json.RawMessage, dels map[string]struct{},
-		pendPuts map[string]json.RawMessage, pendDels map[string]struct{}) error
+	checkUnique(ops map[string]pendingOp) error
+	beginRestore(records int)
+	endRestore()
 	dump() map[string]json.RawMessage
 	clear()
 	count() int
@@ -39,9 +40,10 @@ type anyCollection interface {
 // never reaching the log, and the indexes quietly disagreeing with the data.
 // Everything you get back is yours.
 type Collection[T Entity] struct {
-	db   *DB
-	name string
-	data map[string]json.RawMessage
+	db           *DB
+	name         string
+	data         map[string]json.RawMessage
+	encodedBytes int
 
 	// version is the schema version this build writes; migrations carries each
 	// step from an older on-disk version up to it. See migrate.go.
@@ -183,9 +185,12 @@ func (c *Collection[T]) applyPut(key string, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	// Remove the old entry's index terms first; a record that changed its
-	// indexed field must not remain findable under the old value.
-	c.removeFromIndexes(key)
+	// Indexes replace changed terms and leave unchanged entries in place.
+	old, exists := c.data[key]
+	if !exists {
+		c.encodedBytes += len(key)
+	}
+	c.encodedBytes += len(raw) - len(old)
 	c.data[key] = raw
 	for _, i := range c.multi {
 		i.add(key, v)
@@ -201,6 +206,9 @@ func (c *Collection[T]) applyPut(key string, raw json.RawMessage) error {
 
 func (c *Collection[T]) applyDelete(key string) {
 	c.removeFromIndexes(key)
+	if raw, exists := c.data[key]; exists {
+		c.encodedBytes -= len(key) + len(raw)
+	}
 	delete(c.data, key)
 }
 
@@ -218,6 +226,7 @@ func (c *Collection[T]) removeFromIndexes(key string) {
 
 func (c *Collection[T]) clear() {
 	c.data = make(map[string]json.RawMessage)
+	c.encodedBytes = 0
 	for _, i := range c.multi {
 		i.clear()
 	}
@@ -229,15 +238,36 @@ func (c *Collection[T]) clear() {
 	}
 }
 
+func (c *Collection[T]) beginRestore(records int) {
+	c.clear()
+	c.data = make(map[string]json.RawMessage, records)
+	for _, s := range c.sorted {
+		s.rebuilding = true
+		s.byKey = make(map[string]int64, records)
+	}
+}
+
+func (c *Collection[T]) endRestore() {
+	for _, s := range c.sorted {
+		s.entries = make([]sortedEntry, 0, len(s.byKey))
+		for key, n := range s.byKey {
+			s.entries = append(s.entries, sortedEntry{n: n, key: key})
+		}
+		sort.Slice(s.entries, func(a, b int) bool {
+			if s.entries[a].n != s.entries[b].n {
+				return s.entries[a].n < s.entries[b].n
+			}
+			return s.entries[a].key < s.entries[b].key
+		})
+		s.rebuilding = false
+	}
+}
+
 // bytes reports the encoded size of the records held, for the memory budget.
 // Keys are counted too; the overhead of the maps themselves is not, so this is
 // a floor rather than a true heap measurement.
 func (c *Collection[T]) bytes() int {
-	total := 0
-	for k, v := range c.data {
-		total += len(k) + len(v)
-	}
-	return total
+	return c.encodedBytes
 }
 
 // verify recomputes what this collection should look like and reports every
@@ -277,39 +307,36 @@ func (c *Collection[T]) verify() []string {
 }
 
 func (c *Collection[T]) dump() map[string]json.RawMessage {
-	out := make(map[string]json.RawMessage, len(c.data))
-	for k, v := range c.data {
-		out[k] = v
-	}
-	return out
+	// The caller holds the writer slot until snapshot encoding is complete.
+	return c.data
 }
 
 // checkUnique validates a pending change set against every unique index.
 //
 // It runs at commit, before anything is written, so a transaction may swap a
 // unique value between two records — delete-then-insert, or a straight
-// exchange — which per-Put validation would reject.
-// checkUnique validates this transaction's writes against every unique index.
-//
-// pendPuts and pendDels describe the commit window: records that are in the log
-// and will be applied, but are not in the index yet (see groupcommit.go). They
-// have to count as present, or two commits sharing an fsync could both claim
-// the same term and the index would be corrupt by the time either applied.
-// Both are nil in the ordinary case of nothing in flight.
-func (c *Collection[T]) checkUnique(puts map[string]json.RawMessage, dels map[string]struct{},
-	pendPuts map[string]json.RawMessage, pendDels map[string]struct{}) error {
-	if len(c.unique) == 0 || len(puts) == 0 {
+// exchange — which per-Put validation would reject. The caller holds the state
+// read lock so committed indexes and the pending window form one consistent view.
+func (c *Collection[T]) checkUnique(ops map[string]pendingOp) error {
+	if len(c.unique) == 0 {
 		return nil
 	}
 
-	decoded := make(map[string]T, len(puts))
-	for key, raw := range puts {
-		v, err := c.decode(raw)
+	decoded := make(map[string]T, len(ops))
+	for key, op := range ops {
+		if op.del {
+			continue
+		}
+		v, err := c.decode(op.raw)
 		if err != nil {
 			return err
 		}
 		decoded[key] = v
 	}
+	if len(decoded) == 0 {
+		return nil
+	}
+	pendPuts, pendDels := c.db.pendingOpsFor(c.name)
 	inflight := make(map[string]T, len(pendPuts))
 	for key, raw := range pendPuts {
 		v, err := c.decode(raw)
@@ -365,10 +392,7 @@ func (c *Collection[T]) checkUnique(puts map[string]json.RawMessage, dels map[st
 			}
 			// The holder is only really in the way if this transaction is not
 			// already removing or replacing it.
-			if _, gone := dels[holder]; gone {
-				continue
-			}
-			if _, replaced := puts[holder]; replaced {
+			if _, replaced := ops[holder]; replaced {
 				continue
 			}
 			return fmt.Errorf("%w: %s.%s = %q already held by %q",

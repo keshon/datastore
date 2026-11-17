@@ -95,15 +95,14 @@ func (db *DB) Watch(opts WatchOptions) *Subscription {
 		}
 	}
 
+	sub := &Subscription{db: db, ch: make(chan Event, buf), filter: filter}
+
 	db.mu.RLock()
-	start := db.seq
-	db.mu.RUnlock()
-
-	sub := &Subscription{db: db, ch: make(chan Event, buf), filter: filter, start: start}
-
+	sub.start = db.seq
 	db.subsMu.Lock()
 	db.subs = append(db.subs, sub)
 	db.subsMu.Unlock()
+	db.mu.RUnlock()
 	return sub
 }
 
@@ -195,7 +194,7 @@ func (db *DB) dispatch(fr *walFrame) {
 		// breaking the package's central promise that everything you get back
 		// is yours.
 		for _, sub := range subs {
-			if !sub.wants(op.Coll) {
+			if fr.Seq <= sub.start || !sub.wants(op.Coll) {
 				continue
 			}
 			ev := Event{

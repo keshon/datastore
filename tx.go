@@ -29,9 +29,11 @@ type Tx struct {
 	// against a waiting writer, so reads have to know.
 	holdsLock bool
 
-	writes   map[string]map[string]pendingOp
-	counters map[string]uint64
-	meta     map[string]string
+	writes      map[string]map[string]pendingOp
+	counters    map[string]uint64
+	meta        map[string]string
+	stagedBytes int64
+	stagedOps   int
 }
 
 // Note attaches context to this transaction — who asked for the change and why.
@@ -107,10 +109,8 @@ func (db *DB) Update(fn func(*Tx) error) error {
 	}
 
 	tx := &Tx{
-		db:       db,
-		write:    true,
-		writes:   make(map[string]map[string]pendingOp),
-		counters: make(map[string]uint64),
+		db:    db,
+		write: true,
 	}
 
 	if err := fn(tx); err != nil {
@@ -187,28 +187,20 @@ func (db *DB) commit(tx *Tx, release func()) error {
 		return nil
 	}
 
+	collections := sortedKeys(tx.writes)
 	db.mu.RLock()
-	for _, name := range sortedKeys(tx.writes) {
+	for _, name := range collections {
 		coll, known := db.colls[name]
 		if !known {
 			db.mu.RUnlock()
 			return fmt.Errorf("datastore: collection %q is not registered", name)
 		}
-		puts := make(map[string]json.RawMessage)
-		dels := make(map[string]struct{})
-		for key, op := range tx.writes[name] {
-			if op.del {
-				dels[key] = struct{}{}
-			} else {
-				puts[key] = op.raw
-			}
-		}
 		// Frames in the commit window are in the log and will be applied, so
 		// for uniqueness they already exist. Waiting for them instead would be
 		// simpler, and would also stop any collection with a unique index from
 		// ever batching.
-		pendPuts, pendDels := db.pendingOpsFor(name)
-		if err := coll.checkUnique(puts, dels, pendPuts, pendDels); err != nil {
+		err := coll.checkUnique(tx.writes[name])
+		if err != nil {
 			db.mu.RUnlock()
 			return err
 		}
@@ -221,7 +213,10 @@ func (db *DB) commit(tx *Tx, release func()) error {
 	seq := db.appendSeq + 1
 
 	frame := &walFrame{Seq: seq, TS: db.opts.Clock().Unix()}
-	for _, name := range sortedKeys(tx.writes) {
+	if tx.stagedOps != 0 {
+		frame.Ops = make([]walOp, 0, tx.stagedOps)
+	}
+	for _, name := range collections {
 		keys := make([]string, 0, len(tx.writes[name]))
 		for k := range tx.writes[name] {
 			keys = append(keys, k)
@@ -255,6 +250,17 @@ func (db *DB) commit(tx *Tx, release func()) error {
 	}
 
 	sync := db.opts.Sync == SyncAlways
+	w := db.wal // keep the WAL owner alive if Close follows the settled frame
+	if sync {
+		err = db.waitPendingCapacity(int64(len(buf)))
+		if err != nil {
+			return err
+		}
+	}
+	err = db.failedErr()
+	if err != nil {
+		return err
+	}
 	started := time.Now()
 
 	// Append without syncing. Under SyncAlways the fsync happens below, shared
@@ -282,10 +288,8 @@ func (db *DB) commit(tx *Tx, release func()) error {
 		}
 		durable := time.Since(started)
 
-		db.mu.RLock()
-		walBytes := db.wal.sizeNow()
+		walBytes := w.sizeNow()
 		needCompact := walBytes >= db.opts.CompactAfterBytes
-		db.mu.RUnlock()
 
 		if db.opts.OnCommit != nil {
 			db.opts.OnCommit(CommitStats{
@@ -372,6 +376,9 @@ func (db *DB) commit(tx *Tx, release func()) error {
 // The value is reserved within the transaction and only becomes permanent when
 // it commits, so an abandoned transaction does not burn an id.
 func (tx *Tx) NextID(name string) uint64 {
+	if tx.counters == nil {
+		tx.counters = make(map[string]uint64)
+	}
 	if v, ok := tx.counters[name]; ok {
 		tx.counters[name] = v + 1
 		return v + 1
@@ -476,8 +483,7 @@ func (tc *TxCollection[T]) Put(v T) error {
 	if err != nil {
 		return fmt.Errorf("datastore: encode %s/%s: %w", tc.c.name, key, err)
 	}
-	tc.stage(key, pendingOp{raw: raw})
-	return nil
+	return tc.stage(key, pendingOp{raw: raw})
 }
 
 // Delete stages a removal. Removing an absent key is not an error.
@@ -488,22 +494,57 @@ func (tc *TxCollection[T]) Delete(key string) error {
 	if key == "" {
 		return fmt.Errorf("%w: %s", ErrEmptyKey, tc.c.name)
 	}
-	tc.stage(key, pendingOp{del: true})
-	return nil
+	return tc.stage(key, pendingOp{del: true})
 }
 
-func (tc *TxCollection[T]) stage(key string, op pendingOp) {
+func (tc *TxCollection[T]) stage(key string, op pendingOp) error {
+	old, exists := tc.tx.writes[tc.c.name][key]
+	bytes := tc.tx.stagedBytes + int64(len(op.raw)-len(old.raw))
+	opCount := tc.tx.stagedOps
+	if !exists {
+		bytes += int64(len(tc.c.name) + len(key))
+		opCount++
+	}
+	options := &tc.tx.db.opts
+	if options.MaxTransactionBytes > 0 && bytes > options.MaxTransactionBytes {
+		return fmt.Errorf("%w: staged bytes %d exceed %d", ErrTransactionTooLarge, bytes, options.MaxTransactionBytes)
+	}
+	if options.MaxTransactionOps > 0 && opCount > options.MaxTransactionOps {
+		return fmt.Errorf("%w: staged operations %d exceed %d", ErrTransactionTooLarge, opCount, options.MaxTransactionOps)
+	}
+
+	if tc.tx.writes == nil {
+		tc.tx.writes = make(map[string]map[string]pendingOp)
+	}
 	ops, ok := tc.tx.writes[tc.c.name]
 	if !ok {
 		ops = make(map[string]pendingOp)
 		tc.tx.writes[tc.c.name] = ops
 	}
 	ops[key] = op
+	tc.tx.stagedBytes = bytes
+	tc.tx.stagedOps = opCount
+	return nil
 }
 
 // Len reports how many records the collection holds as this transaction sees
 // it: the committed count adjusted for its own staged writes.
-func (tc *TxCollection[T]) Len() int { return len(tc.Keys()) }
+func (tc *TxCollection[T]) Len() int {
+	var n int
+	tc.tx.withRead(func() {
+		n = len(tc.c.data)
+		for key, op := range tc.tx.writes[tc.c.name] {
+			_, exists := tc.c.data[key]
+			if op.del && exists {
+				n--
+			}
+			if !op.del && !exists {
+				n++
+			}
+		}
+	})
+	return n
+}
 
 // Keys returns every key as this transaction sees it, sorted: the committed
 // keys, plus its own staged puts, minus its own staged deletes.

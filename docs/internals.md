@@ -26,7 +26,10 @@ compaction before releasing resources. Check its returned error.
 
 Records stay encoded; each read decodes a new value, so changing a returned
 struct cannot mutate stored state or indexes. Indexes are rebuilt when records
-are loaded or replayed. Index extraction must be deterministic for a record.
+are loaded or replayed. During recovery, sorted indexes accumulate final terms
+by record key and sort once after WAL replay, avoiding repeated slice shifts.
+Normal updates keep unchanged index terms in place. Index extraction must be
+deterministic for a record.
 
 Transactions stage changes until commit. Collection reads through `In(tx, c)`
 can see staged writes; transaction-scoped index reads use committed indexes.
@@ -75,13 +78,25 @@ Compaction encodes the full dataset, writes a temporary snapshot, syncs the file
 renames it into place, and syncs the directory on Unix before discarding or
 archiving the covered live log. At least two snapshots are retained. The
 sequence lets replay ignore already-snapshotted frames if a crash leaves both
-snapshot and log. Full snapshot encoding requires additional memory, and state
-application can wait while compaction holds locks.
+snapshot and log. The writer slot remains held throughout compaction. Once
+pending commits are drained, snapshot encoding borrows immutable record maps
+without copying them, then releases the state lock during encoding and file I/O.
+Readers can proceed during this phase; writers still wait. Log reset or rotation
+uses the state lock again.
 
-Windows `syncDir` is a no-op. Snapshot installation therefore lacks the explicit
-directory-sync barrier used on Unix. Atomic rename and file-content sync do not
-establish the same metadata durability guarantee. The process and simulated WAL
-crash tests do not prove every filesystem's power-loss behavior.
+Encoding streams the payload and its CRC32C through bounded buffers, then writes
+the checksum after the payload in the same version-1 envelope. Keys are sorted
+per collection, requiring O(records) temporary key references; payload-sized JSON
+buffers are no longer constructed. Decoding borrows the envelope payload from
+the input file buffer, while record RawMessages own their bytes. Opening still
+reads the complete snapshot file and rebuilds indexes in memory.
+
+Windows `syncDir` remains a no-op. Snapshot installation uses `MoveFileExW` with
+`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` after syncing and closing the
+temporary file. This requests write-through installation, with long-path support,
+but does not establish the same directory-sync guarantee as Unix or certify
+physical power-loss behavior. See Microsoft's
+[MoveFileExW contract](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw).
 
 ### Upgrading and downgrading
 
@@ -127,6 +142,13 @@ before waiting permits batching without publishing unflushed state. Other
 modes do not use this commit-path batching because they do not flush there.
 The batching ratio depends on scheduling and I/O; there is no fixed ratio.
 
+Constraint checks fold the flushing batch before the next pending batch, in
+sequence order, ignoring frames already applied under the state lock. The
+flushing batch stays registered until settlement. A failed flush latches failure;
+later queued batches are rejected rather than retried and acknowledged.
+`MaxPendingBytes` optionally applies backpressure before append. Staging limits
+and pending-frame limits are described in the guide.
+
 ## Durability, per database
 
 `Options.Sync` applies to the database directory, not individual writes:
@@ -147,6 +169,8 @@ A WAL write or sync failure latches a failed state and later writes return
 original failure. Close and reopen to recover and inspect the recovery report.
 An error during application of an already-durable frame also latches failure:
 state and log may disagree, and subsequent recovery may fail on that frame.
+A log-reset failure during compaction also latches failure: the installed snapshot
+still covers the state, but the live WAL header may be partial.
 
 ## Tests
 

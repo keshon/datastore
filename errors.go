@@ -3,6 +3,10 @@ package datastore
 import "errors"
 
 var (
+	// ErrTransactionTooLarge reports a configured transaction or pending-frame
+	// limit. The rejected operation has not been appended to the WAL.
+	ErrTransactionTooLarge = errors.New("datastore: transaction size limit exceeded")
+
 	// ErrNotOpen is returned when the database is used before Open or after Close.
 	ErrNotOpen = errors.New("datastore: not open")
 

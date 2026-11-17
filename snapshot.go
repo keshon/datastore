@@ -1,11 +1,13 @@
 package datastore
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -75,7 +77,20 @@ type snapshotFile struct {
 type snapshotEnvelope struct {
 	Version int             `json:"v"`
 	CRC     uint32          `json:"crc32c"`
-	Payload json.RawMessage `json:"payload"`
+	Payload snapshotPayload `json:"payload"`
+}
+
+// snapshotPayload borrows the input during decodeSnapshot. Record RawMessages
+// are copied by the second decode, so the file buffer is not retained in state.
+type snapshotPayload []byte
+
+func (p *snapshotPayload) UnmarshalJSON(b []byte) error {
+	*p = b
+	return nil
+}
+
+func (p snapshotPayload) MarshalJSON() ([]byte, error) {
+	return p, nil
 }
 
 // listSnapshots returns the sequence numbers present, newest last.
@@ -171,9 +186,8 @@ func decodeSnapshot(b []byte) (*snapshotFile, error) {
 
 // loadSnapshot reads the newest snapshot that parses and passes its checksum.
 //
-// Falling back to an older one is safe because the log is only ever truncated
-// after a newer snapshot is durable — so an older snapshot plus the surviving
-// log still reconstructs the same state. Returns nil when there is none.
+// A fallback is reported: an older snapshot may lose compacted state if the live
+// log no longer bridges the gap. Returns nil when there is no usable snapshot.
 func loadSnapshot(dir string) (*snapshotFile, []string, error) {
 	seqs, err := listSnapshots(dir)
 	if err != nil {
@@ -202,15 +216,8 @@ func loadSnapshot(dir string) (*snapshotFile, []string, error) {
 }
 
 // writeSnapshot writes a snapshot atomically: a temporary file in the same
-// directory, fsynced, then renamed over the target, then the directory itself
-// fsynced so the rename survives a power cut.
+// directory, fsynced, then installed with the platform's durability barriers.
 func writeSnapshot(dir string, snap *snapshotFile) error {
-	payload, err := json.Marshal(snap)
-	if err != nil {
-		return fmt.Errorf("datastore: encode snapshot: %w", err)
-	}
-	b := wrapSnapshot(payload)
-
 	tmp, err := os.CreateTemp(dir, ".snapshot-*.tmp")
 	if err != nil {
 		return fmt.Errorf("datastore: create temp snapshot: %w", err)
@@ -221,31 +228,144 @@ func writeSnapshot(dir string, snap *snapshotFile) error {
 	// CreateTemp makes the file 0o600, but the snapshot holds the same data as
 	// the 0o644 log — a backup job running as another user should not find the
 	// full state stricter than the tail of it.
-	if err := tmp.Chmod(0o644); err != nil {
+	err = tmp.Chmod(0o644)
+	if err != nil {
 		tmp.Close()
 		return fmt.Errorf("datastore: chmod temp snapshot: %w", err)
 	}
 
-	if _, err := tmp.Write(b); err != nil {
+	err = encodeSnapshot(tmp, snap)
+	if err != nil {
 		tmp.Close()
 		return fmt.Errorf("datastore: write temp snapshot: %w", err)
 	}
-	if err := tmp.Sync(); err != nil {
+	err = tmp.Sync()
+	if err != nil {
 		tmp.Close()
 		return fmt.Errorf("datastore: sync temp snapshot: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
+	err = tmp.Close()
+	if err != nil {
 		return fmt.Errorf("datastore: close temp snapshot: %w", err)
 	}
 
 	final := filepath.Join(dir, snapshotName(snap.Seq))
-	if err := os.Rename(tmpPath, final); err != nil {
+	err = installSnapshot(tmpPath, final)
+	if err != nil {
 		return fmt.Errorf("datastore: install snapshot: %w", err)
 	}
-	if err := syncDir(dir); err != nil {
+	err = syncDir(dir)
+	if err != nil {
 		return fmt.Errorf("datastore: sync directory: %w", err)
 	}
 	return nil
+}
+
+// snapshotJSON keeps the first encoding or I/O error. Raw records are immutable
+// while the writer slot is held; streaming them avoids dataset-sized buffers.
+type snapshotJSON struct {
+	w   io.Writer
+	err error
+}
+
+func (s *snapshotJSON) text(v string) {
+	if s.err != nil {
+		return
+	}
+	_, s.err = io.WriteString(s.w, v)
+}
+
+func (s *snapshotJSON) value(v any) {
+	if s.err != nil {
+		return
+	}
+	var b []byte
+	b, s.err = json.Marshal(v)
+	if s.err == nil {
+		_, s.err = s.w.Write(b)
+	}
+}
+
+func (s *snapshotJSON) key(v string) {
+	for i := range len(v) {
+		c := v[i]
+		if c < 0x20 || c >= 0x80 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			s.value(v)
+			return
+		}
+	}
+	s.text(`"`)
+	s.text(v)
+	s.text(`"`)
+}
+
+func encodeSnapshot(w io.Writer, snap *snapshotFile) error {
+	buffer := bufio.NewWriterSize(w, 64<<10)
+	envelope := snapshotJSON{w: buffer}
+	envelope.text(`{"collections":`)
+	envelope.value(downgradeTrap)
+	envelope.text(`,"v":`)
+	envelope.value(snapshotFormatVersion)
+	envelope.text(`,"payload":`)
+	if envelope.err != nil {
+		return envelope.err
+	}
+
+	checksum := crc32.New(crcTable)
+	checksummed := bufio.NewWriterSize(io.MultiWriter(buffer, checksum), 64<<10)
+	payload := snapshotJSON{w: checksummed}
+	payload.text(`{"seq":`)
+	payload.value(snap.Seq)
+	payload.text(`,"ts":`)
+	payload.value(snap.TS)
+	if len(snap.Counters) != 0 {
+		payload.text(`,"counters":`)
+		payload.value(snap.Counters)
+	}
+	if len(snap.Versions) != 0 {
+		payload.text(`,"versions":`)
+		payload.value(snap.Versions)
+	}
+	payload.text(`,"collections":{`)
+	for i, name := range sortedKeys(snap.Collections) {
+		if i != 0 {
+			payload.text(",")
+		}
+		payload.key(name)
+		payload.text(":{")
+		rows := snap.Collections[name]
+		for j, key := range sortedKeys(rows) {
+			if j != 0 {
+				payload.text(",")
+			}
+			payload.key(key)
+			payload.text(":")
+			if !json.Valid(rows[key]) {
+				return fmt.Errorf("invalid JSON in %s/%s", name, key)
+			}
+			if payload.err != nil {
+				return payload.err
+			}
+			_, payload.err = payload.w.Write(rows[key])
+		}
+		payload.text("}")
+	}
+	payload.text("}}")
+	if payload.err != nil {
+		return payload.err
+	}
+	err := checksummed.Flush()
+	if err != nil {
+		return err
+	}
+
+	envelope.text(`,"crc32c":`)
+	envelope.value(checksum.Sum32())
+	envelope.text("}\n")
+	if envelope.err != nil {
+		return envelope.err
+	}
+	return buffer.Flush()
 }
 
 // pruneSnapshots deletes all but the newest `keep`.

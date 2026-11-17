@@ -2,8 +2,7 @@
 //
 // It holds everything in memory and appends every commit to a write-ahead log
 // before acknowledging it. That combination is only reasonable because of a
-// specific assumption: the whole dataset fits comfortably in RAM — a few
-// hundred kilobytes today, perhaps twenty megabytes in a decade. Set
+// specific assumption: the whole dataset and its indexes fit comfortably in RAM. Set
 // Options.MaxBytes and the store will tell you long before that assumption
 // stops holding; note that it counts encoded records rather than heap, and see
 // its documentation for the difference. When the assumption does stop holding,
