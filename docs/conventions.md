@@ -38,8 +38,14 @@ go test -run '^$' -fuzz FuzzFrameParsing -fuzztime 60s .
 ```
 
 Keep failing fuzz inputs as regression seeds under `testdata/fuzz/` when useful.
-For performance and heap measurements, see the commands in
-[historical measurements](internal/measurements.md#reproduce-with-current-fixtures).
+For performance and heap measurements:
+
+```sh
+go test -run '^$' -bench . -benchmem .
+go test -run '^TestMemoryFootprint$' -count=1 -v .
+```
+
+Record the commit, Go version, OS, CPU, storage and fixture with the output.
 Do not turn one machine's timings into correctness assertions.
 
 The capacity probe is opt-in and writes roughly a gigabyte at one million records.
@@ -129,7 +135,7 @@ local checks exercise only the host platform.
 Keep setup and operation in [guide.md](guide.md), implementation contracts in
 [internals.md](internals.md), and contributor workflows here. The
 [README](../README.md) provides the minimal start and navigation. API contracts
-and defaults belong next to their declarations in Go source. Historical
-measurements belong in `docs/internal/`, with their evidence limits stated.
+and defaults belong next to their declarations in Go source. Keep dated
+investigations and one-off measurements out of the maintained guides.
 Check relative links and heading fragments after moving content. There is no
 documentation generator or dedicated Markdown check in the current CI.

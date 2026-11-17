@@ -290,8 +290,8 @@ sorted-index entries once; changing a sorted term during ordinary writes still
 shifts a slice and costs O(records). Reads still decode independent copies.
 
 Measure your own record and index shapes with `TestMemoryFootprint` and the
-opt-in `TestCapacity` described in the contributor guide;
-[historical estimates](internal/measurements.md) are not a heap budget.
+opt-in `TestCapacity` described in the [contributor guide](conventions.md).
+Payload accounting is not a heap budget.
 
 `Options.OnCommit` runs on the committing goroutine. Keep it short and do not
 access the database from it; record metrics and return.

@@ -119,10 +119,6 @@ That example uses a temporary database and removes it when finished.
   implementation contracts.
 - [API reference](https://pkg.go.dev/github.com/keshon/datastore) — exported types
   and methods; source declarations define defaults and contracts.
-- [Historical measurements](docs/internal/measurements.md) — previously published
-  estimates and commands for measuring the current implementation.
-- [GEKTOR storage assessment, 2026-11-13](docs/internal/2026-11-13-gektor-storage-assessment.md)
-  — reproduced concurrent unique-index defect and application fit assessment.
 
 ## License
 
