@@ -29,6 +29,7 @@ type Index[T Entity] struct {
 }
 
 // AddIndex declares a multi-valued index. Must be called before Open.
+// The extractor must not mutate its record or later change returned term slices.
 func AddIndex[T Entity](c *Collection[T], name string, terms func(T) []string) *Index[T] {
 	c.db.mu.Lock()
 	defer c.db.mu.Unlock()
@@ -200,6 +201,7 @@ type UniqueIndex[T Entity] struct {
 }
 
 // AddUnique declares a unique index. Must be called before Open.
+// The extractor receives an internal record and must not mutate it.
 func AddUnique[T Entity](c *Collection[T], name string, term func(T) string) *UniqueIndex[T] {
 	c.db.mu.Lock()
 	defer c.db.mu.Unlock()
@@ -283,6 +285,7 @@ type SortedIndex[T Entity] struct {
 }
 
 // AddSorted declares a sorted index. Must be called before Open.
+// The extractor receives an internal record and must not mutate it.
 func AddSorted[T Entity](c *Collection[T], name string, key func(T) int64) *SortedIndex[T] {
 	c.db.mu.Lock()
 	defer c.db.mu.Unlock()
@@ -439,89 +442,126 @@ func (s *SortedIndex[T]) Len() int {
 // state maintained incrementally, and incremental maintenance is exactly the
 // kind of thing that can drift silently. See DB.Verify.
 
-func (i *Index[T]) verify(fresh map[string]T) []string {
-	want := make(map[string]map[string]struct{})
-	for key, v := range fresh {
-		for _, t := range i.terms(v) {
-			if want[t] == nil {
-				want[t] = make(map[string]struct{})
-			}
-			want[t][key] = struct{}{}
-		}
-	}
-
+func (i *Index[T]) verifyRecord(key string, v T, seen map[string]struct{}) (int, []string) {
 	var problems []string
-	for term, keys := range want {
-		got := i.byTerm[term]
-		for k := range keys {
-			if _, ok := got[k]; !ok {
-				problems = append(problems, describeIndexDrift(i.coll.collName(), i.name, term, k, "missing from the index"))
+	terms := i.terms(v)
+	if !slices.Equal(terms, i.byKey[key]) {
+		problems = append(problems, describeIndexDrift(i.coll.name, i.name, "", key, "reverse terms disagree with the record"))
+	}
+	clear(seen)
+	links := 0
+	for _, term := range terms {
+		if len(terms) > 1 {
+			if _, exists := seen[term]; exists {
+				continue
 			}
+			seen[term] = struct{}{}
+		}
+		links++
+		if _, ok := i.byTerm[term][key]; !ok {
+			problems = append(problems, describeIndexDrift(i.coll.name, i.name, term, key, "missing from the index"))
 		}
 	}
-	for term, keys := range i.byTerm {
-		for k := range keys {
-			if _, ok := want[term][k]; !ok {
-				problems = append(problems, describeIndexDrift(i.coll.collName(), i.name, term, k, "indexed but not produced by the record"))
-			}
+	return links, problems
+}
+
+func (i *Index[T]) verify(expectedLinks int) []string {
+	var problems []string
+	for key := range i.byKey {
+		if _, exists := i.coll.data[key]; !exists {
+			problems = append(problems, describeIndexDrift(i.coll.name, i.name, "", key, "reverse index points at a missing record"))
 		}
+	}
+	links := 0
+	for term, keys := range i.byTerm {
+		if len(keys) == 0 {
+			problems = append(problems, describeIndexDrift(i.coll.name, i.name, term, "", "term has no records"))
+		}
+		links += len(keys)
+	}
+	// Every expected link was checked against the records. Equal cardinality
+	// then proves there are no extra links, without quadratic scans of tag lists.
+	if links != expectedLinks {
+		problems = append(problems, fmt.Sprintf("%s.%s: index holds %d links, records imply %d", i.coll.name, i.name, links, expectedLinks))
 	}
 	return problems
 }
 
-func (u *UniqueIndex[T]) verify(fresh map[string]T) []string {
+func (u *UniqueIndex[T]) verifyRecord(key string, v T) []string {
 	var problems []string
-	want := make(map[string]string, len(fresh))
-	for key, v := range fresh {
-		t := u.term(v)
-		if t == "" {
-			continue
+	term := u.term(v)
+	reverse, indexed := u.byKey[key]
+	if term == "" {
+		if indexed {
+			problems = append(problems, describeIndexDrift(u.coll.name, u.name, reverse, key, "record should not be indexed"))
 		}
-		if other, clash := want[t]; clash {
-			problems = append(problems, describeIndexDrift(u.coll.collName(), u.name, t, key,
-				"duplicate term also held by "+other+"; the unique constraint is violated in the data"))
-			continue
-		}
-		want[t] = key
+		return problems
 	}
+	if !indexed || reverse != term {
+		problems = append(problems, describeIndexDrift(u.coll.name, u.name, term, key, "reverse term disagrees with the record"))
+	}
+	owner, exists := u.byTerm[term]
+	if exists && owner == key {
+		return problems
+	}
+	detail := "index points at " + owner + " instead"
+	if raw, found := u.coll.data[owner]; found && owner != key {
+		other, err := u.coll.decode(raw)
+		if err == nil && u.term(other) == term {
+			detail = "duplicate term also held by " + owner + "; the unique constraint is violated in the data"
+		}
+	}
+	problems = append(problems, describeIndexDrift(u.coll.name, u.name, term, key, detail))
+	return problems
+}
 
-	for term, key := range want {
-		if got, ok := u.byTerm[term]; !ok || got != key {
-			problems = append(problems, describeIndexDrift(u.coll.collName(), u.name, term, key,
-				"index points at "+got+" instead"))
+func (u *UniqueIndex[T]) verify() []string {
+	var problems []string
+	for key := range u.byKey {
+		if _, exists := u.coll.data[key]; !exists {
+			problems = append(problems, describeIndexDrift(u.coll.name, u.name, "", key, "reverse index points at a missing record"))
 		}
 	}
 	for term, key := range u.byTerm {
-		if _, ok := want[term]; !ok {
-			problems = append(problems, describeIndexDrift(u.coll.collName(), u.name, term, key,
-				"indexed but no record produces the term"))
+		_, exists := u.coll.data[key]
+		if term == "" || !exists || u.byKey[key] != term {
+			problems = append(problems, describeIndexDrift(u.coll.name, u.name, term, key, "indexed but no record produces the term"))
 		}
 	}
 	return problems
 }
 
-func (s *SortedIndex[T]) verify(fresh map[string]T) []string {
-	want := make([]sortedEntry, 0, len(fresh))
-	for key, v := range fresh {
-		want = append(want, sortedEntry{n: s.key(v), key: key})
+func (s *SortedIndex[T]) verifyRecord(key string, v T) []string {
+	want := s.key(v)
+	got, exists := s.byKey[key]
+	if !exists || got != want {
+		return []string{describeIndexDrift(s.coll.name, s.name, "", key, "reverse sort key disagrees with the record")}
 	}
-	sort.Slice(want, func(a, b int) bool {
-		if want[a].n != want[b].n {
-			return want[a].n < want[b].n
-		}
-		return want[a].key < want[b].key
-	})
+	return nil
+}
 
-	if len(want) != len(s.entries) {
-		return []string{fmt.Sprintf("%s.%s: index holds %d entries, records imply %d",
-			s.coll.collName(), s.name, len(s.entries), len(want))}
-	}
+func (s *SortedIndex[T]) verify() []string {
 	var problems []string
-	for i := range want {
-		if want[i] != s.entries[i] {
-			problems = append(problems, fmt.Sprintf(
-				"%s.%s: position %d holds (%d,%q), records imply (%d,%q); the order has drifted",
-				s.coll.collName(), s.name, i, s.entries[i].n, s.entries[i].key, want[i].n, want[i].key))
+	if len(s.entries) != len(s.coll.data) {
+		problems = append(problems, fmt.Sprintf("%s.%s: index holds %d entries, records imply %d", s.coll.name, s.name, len(s.entries), len(s.coll.data)))
+	}
+	for key := range s.byKey {
+		if _, exists := s.coll.data[key]; !exists {
+			problems = append(problems, describeIndexDrift(s.coll.name, s.name, "", key, "reverse index points at a missing record"))
+		}
+	}
+	for i, entry := range s.entries {
+		n, indexed := s.byKey[entry.key]
+		_, exists := s.coll.data[entry.key]
+		if !indexed || !exists || n != entry.n {
+			problems = append(problems, describeIndexDrift(s.coll.name, s.name, "", entry.key, "sorted entry disagrees with the record"))
+		}
+		if i == 0 {
+			continue
+		}
+		previous := s.entries[i-1]
+		if previous.n > entry.n || (previous.n == entry.n && previous.key >= entry.key) {
+			problems = append(problems, describeIndexDrift(s.coll.name, s.name, "", entry.key, "entries are duplicated or out of order"))
 		}
 	}
 	return problems
@@ -539,7 +579,11 @@ func window(entries []sortedEntry, limit, offset int, reverse bool) []sortedEntr
 	if offset >= n {
 		return nil
 	}
-	out := make([]sortedEntry, 0, n-offset)
+	count := n - offset
+	if limit > 0 {
+		count = min(count, limit)
+	}
+	out := make([]sortedEntry, 0, count)
 	if reverse {
 		for i := n - 1 - offset; i >= 0; i-- {
 			out = append(out, entries[i])

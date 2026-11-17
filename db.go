@@ -502,7 +502,7 @@ func (db *DB) applyRestoredLocked(coll anyCollection, key string, raw json.RawMe
 }
 
 func (db *DB) applyFrameLocked(fr *walFrame) error {
-	for _, op := range fr.Ops {
+	for i, op := range fr.Ops {
 		coll, known := db.colls[op.Coll]
 		if !known {
 			rows, ok := db.orphans[op.Coll]
@@ -526,8 +526,12 @@ func (db *DB) applyFrameLocked(fr *walFrame) error {
 			coll.applyDelete(op.Key)
 			continue
 		}
-		// During recovery this migrates; once open, diskVersions is empty and
-		// applyRestoredLocked is a plain applyPut.
+		if op.decoded != nil {
+			coll.applyPrepared(op.Key, op.Val, op.decoded)
+			fr.Ops[i].decoded = nil
+			continue
+		}
+		// Replayed operations have no prepared value and may need migration.
 		if err := db.applyRestoredLocked(coll, op.Key, op.Val); err != nil {
 			return err
 		}

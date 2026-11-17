@@ -1,6 +1,7 @@
 package datastore
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +12,62 @@ import (
 	"testing"
 	"time"
 )
+
+func TestVerifyWorkingSet(t *testing.T) {
+	value := os.Getenv("DS_VERIFY_RECORDS")
+	if value == "" {
+		t.Skip("set DS_VERIFY_RECORDS to measure sampled verification heap")
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		t.Fatal("DS_VERIFY_RECORDS must be a positive integer")
+	}
+	snap := scalingSnapshot(t, n)
+	dir := t.TempDir()
+	err = writeSnapshot(dir, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap = nil
+	f := newUnopenedFixture(dir)
+	err = f.db.OpenReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.db.Close() })
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	peakResult := make(chan uint64, 1)
+	go func() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		peak := before.HeapAlloc
+		for {
+			var sample runtime.MemStats
+			runtime.ReadMemStats(&sample)
+			peak = max(peak, sample.HeapAlloc)
+			select {
+			case <-ctx.Done():
+				peakResult <- peak
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	started := time.Now()
+	err = f.db.Verify()
+	elapsed := time.Since(started)
+	runtime.ReadMemStats(&after)
+	cancel()
+	peak := <-peakResult
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("records=%d duration=%s base_heap=%d sampled_peak_heap=%d peak_growth=%d allocated=%d gc_cycles=%d", n, elapsed, before.HeapAlloc, peak, peak-before.HeapAlloc, after.TotalAlloc-before.TotalAlloc, after.NumGC-before.NumGC)
+}
 
 func scalingSnapshot(tb testing.TB, n int) *snapshotFile {
 	tb.Helper()
@@ -123,6 +180,59 @@ func BenchmarkSnapshotLarge(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		err := writeSnapshot(dir, snap)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkVerifyLarge(b *testing.B) {
+	snap := scalingSnapshot(b, 100_000)
+	dir := b.TempDir()
+	err := writeSnapshot(dir, snap)
+	if err != nil {
+		b.Fatal(err)
+	}
+	snap = nil
+	f := newUnopenedFixture(dir)
+	err = f.db.OpenReader()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = f.db.Close() })
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		err = f.db.Verify()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSortedPage(b *testing.B) {
+	entries := make([]sortedEntry, 1_000_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		page := window(entries, 10, 0, false)
+		if len(page) != 10 {
+			b.Fatal("incorrect page length")
+		}
+	}
+}
+
+func BenchmarkIndexedOverwrite(b *testing.B) {
+	f := benchFixture(b, func(o *Options) { o.Sync = SyncNever })
+	v := &order{ID: "a", Email: "a@example.com", Customer: strings.Repeat("x", 960)}
+	err := f.orders.Put(v)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		err = f.orders.Put(v)
 		if err != nil {
 			b.Fatal(err)
 		}

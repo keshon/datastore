@@ -207,3 +207,67 @@ snapshot, close and watch boundaries. Linux and macOS builds passed with
 Changed Go files pass gofmt. A repository-wide `gofmt -l .` also lists pre-existing
 CRLF-only files in this checkout; their original bytes were retained to avoid
 unrelated working-tree changes. No formatting-only content changes are included.
+
+## 2026-11-17: commit preparation, verification and sorted pages
+
+The comparison baseline is `d4ef3c5`, after the hardening above, on the same
+Windows/i5-9600KF host. These changes preserve the public API and WAL format.
+
+`BenchmarkSortedPage` takes ten entries from a million-entry sorted index. Its
+temporary allocation fell from 24,002,560 to 240 bytes per operation, with one
+allocation in both versions. The result slice now reserves the requested page
+size rather than all remaining entries. This benchmark measures the internal
+page selection, excluding record decoding.
+
+`BenchmarkIndexedOverwrite` overwrites one roughly 1 KB record with a unique
+index, using `SyncNever` to isolate allocation costs. At 10,000 operations per
+sample, baseline runs allocated 6,266-6,267 bytes and 29 allocations per operation;
+prepared-value reuse allocated 4,902-4,904 bytes and 21 allocations. The private
+decoded value is reused for constraint checks and application, including pending
+group-commit checks. No caller-owned value is retained. These figures do not
+predict durable commit latency, where storage sync remains relevant.
+
+`BenchmarkVerifyLarge` checks 100,000 roughly 1 KB records. Baseline allocated
+158,933,323 bytes and 1,001,051 allocations per check; the final implementation
+allocated 140,800,009-140,800,089 bytes and 1,000,000 allocations in three samples
+of five checks. Verification no longer retains decoded records or rebuilt
+indexes, and now checks reverse links and payload accounting too. JSON decoding
+still accounts for most allocations. CPU and allocation profiles were inspected
+with `go tool pprof`, focusing on verification; profiles also contain fixture
+construction and benchmark calibration, so their overall totals are not treated
+as verification-only figures. Raw profiles remain temporary local artifacts.
+
+An intermediate streaming implementation was also compared with the baseline
+using `DS_VERIFY_RECORDS=100000 go test . -run '^TestVerifyWorkingSet$' -count=3 -v`.
+Starting from about 152.74 MB live heap after explicit GC, baseline sampled peak
+growth was 141.60-146.79 MB; streaming growth was 139.19-140.09 MB. Both triggered
+one GC cycle. Sampling every 5 ms measures Go heap, not exact peak or process RSS.
+Removing retained objects did not produce a dramatic observed heap-peak or GC
+count improvement in this fixture. Do not infer one from lower allocation totals.
+
+The verification allocation benchmark batch overlapped capacity testing; its
+elapsed times are deliberately omitted. Sorted-page and overwrite benchmarks
+were repeated afterward without those tests running. Allocation counts are
+observations for these fixtures, not performance guarantees.
+
+Capacity tests passed again at both 100,000 and 1,000,000 records, with the same
+fixture and compaction threshold as above. The million-record import allocated
+5,829,593,360 bytes with 25 GC cycles, versus 7,335,492,328 bytes and 32 cycles in
+the first hardening run. This is about 20.5% less allocation in this workload.
+The first part of the new capacity run overlapped the verification benchmark;
+neither elapsed time nor GC-cycle count is a controlled speed comparison.
+Post-GC resident Go heap remained about 1.893 GB, because the stored representation
+and index layout have not changed. Verification allocated 1,447,999,696 bytes
+versus 1,835,030,288 previously, with one GC cycle in each run. Compaction still
+allocated about 16.2 MB with zero GC cycles. Reopening and integrity checks passed;
+these remain process tests, not physical power-loss certification.
+
+The full race suite with `DS_FULL_SWEEP=1` and `DS_CRASH_ROUNDS=40` passed in
+339.219s. The frame-parser fuzz target ran for 60 seconds with two workers,
+2,364 executions and no failure. New tests cover corrupt forward/reverse index
+mappings, duplicate sorted entries, unique-value corruption, payload accounting,
+preflight rejection before WAL append, value entities, and caller mutation of
+fields and nested slices while sync is paused. The last ownership test passed
+ten repetitions with the race detector after its nested-slice assertion was added.
+`go vet ./...`, `go build ./...`, formatting of the changed Go files, and
+`git diff --check` also passed.

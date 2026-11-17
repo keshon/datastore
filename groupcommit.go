@@ -30,7 +30,6 @@ package datastore
 // there is nothing to amortise and they keep applying inline.
 
 import (
-	"encoding/json"
 	"fmt"
 	"sync"
 )
@@ -241,7 +240,8 @@ func (db *DB) applyBatch(batch []*pendingFrame) (int, error) {
 //
 // The fold is in sequence order, so a later frame overrides an earlier one,
 // which is what makes the result equivalent to having applied them all.
-func (db *DB) pendingOpsFor(coll string) (puts map[string]json.RawMessage, dels map[string]struct{}) {
+// Put values are collection-owned decoded records prepared before WAL append.
+func (db *DB) pendingOpsFor(coll string) (puts map[string]any, dels map[string]struct{}) {
 	g := db.group
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -271,9 +271,9 @@ func (db *DB) pendingOpsFor(coll string) (puts map[string]json.RawMessage, dels 
 					delete(dels, op.Key)
 				}
 				if puts == nil {
-					puts = make(map[string]json.RawMessage)
+					puts = make(map[string]any)
 				}
-				puts[op.Key] = op.Val
+				puts[op.Key] = op.decoded
 			}
 		}
 	}

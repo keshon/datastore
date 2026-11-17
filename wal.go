@@ -88,6 +88,10 @@ type walOp struct {
 	Key  string          `json:"k"`
 	Op   opKind          `json:"o"`
 	Val  json.RawMessage `json:"v,omitempty"`
+
+	// decoded belongs to the collection from commit preflight until application.
+	// Replayed operations leave it nil and decode their stored JSON normally.
+	decoded any
 }
 
 // walFrame is one committed transaction: the unit that is atomic on disk.

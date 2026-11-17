@@ -188,7 +188,16 @@ func (db *DB) commit(tx *Tx, release func()) error {
 	}
 
 	collections := sortedKeys(tx.writes)
+	frame := &walFrame{}
+	if tx.stagedOps != 0 {
+		frame.Ops = make([]walOp, 0, tx.stagedOps)
+	}
 	db.mu.RLock()
+	if db.failed != nil {
+		failure := db.failed
+		db.mu.RUnlock()
+		return fmt.Errorf("%w: %v", ErrFailed, failure)
+	}
 	for _, name := range collections {
 		coll, known := db.colls[name]
 		if !known {
@@ -199,7 +208,8 @@ func (db *DB) commit(tx *Tx, release func()) error {
 		// for uniqueness they already exist. Waiting for them instead would be
 		// simpler, and would also stop any collection with a unique index from
 		// ever batching.
-		err := coll.checkUnique(tx.writes[name])
+		var err error
+		frame.Ops, err = coll.prepare(tx.writes[name], frame.Ops)
 		if err != nil {
 			db.mu.RUnlock()
 			return err
@@ -212,25 +222,8 @@ func (db *DB) commit(tx *Tx, release func()) error {
 	// this needs no lock of its own.
 	seq := db.appendSeq + 1
 
-	frame := &walFrame{Seq: seq, TS: db.opts.Clock().Unix()}
-	if tx.stagedOps != 0 {
-		frame.Ops = make([]walOp, 0, tx.stagedOps)
-	}
-	for _, name := range collections {
-		keys := make([]string, 0, len(tx.writes[name]))
-		for k := range tx.writes[name] {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			op := tx.writes[name][key]
-			if op.del {
-				frame.Ops = append(frame.Ops, walOp{Coll: name, Key: key, Op: opDelete})
-			} else {
-				frame.Ops = append(frame.Ops, walOp{Coll: name, Key: key, Op: opPut, Val: op.raw})
-			}
-		}
-	}
+	frame.Seq = seq
+	frame.TS = db.opts.Clock().Unix()
 	if len(tx.counters) > 0 {
 		frame.Counters = make(map[string]uint64, len(tx.counters))
 		for k, v := range tx.counters {

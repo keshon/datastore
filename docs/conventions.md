@@ -94,7 +94,8 @@ storage devices or Windows snapshot metadata durability.
 - **Invariant:** under `SyncAlways`, acknowledge and publish a commit only
   after the covering WAL sync. Preserve sequence ordering across the pending
   window, including failure paths. See [the commit flow](internals.md#commit-flow).
-- **Invariant:** index functions must be deterministic for a record. Rebuilds
+- **Invariant:** index functions must be deterministic and treat records and
+  returned term slices as read-only. Rebuilds
   and incremental updates must produce the same indexes; `Verify()` reports
   disagreement. Do not call the database from index functions.
 - **Invariant:** use the transaction-scoped `In*` methods within callbacks.

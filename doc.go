@@ -28,7 +28,7 @@
 //   - A change feed (Watch) that can never slow a commit down.
 //   - A recovery report, so an application can tell whether the last Open lost
 //     anything instead of hoping somebody reads the log.
-//   - Verify, which rebuilds the indexes from the records and reports drift.
+//   - Verify, which checks records against index mappings and reports drift.
 //   - Read-only opens, so a second process can inspect a live database.
 //   - Backup by copying a directory.
 //

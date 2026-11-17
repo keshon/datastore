@@ -252,7 +252,9 @@ acknowledged records were lost. Investigate the full report before accepting
 new work. `Clean()` also requires no migrations, so it is false after a routine
 schema upgrade without necessarily indicating data loss.
 
-`db.Verify()` rebuilds every index from the records and reports disagreements.
+`db.Verify()` recomputes index terms from records and reports disagreements in
+both index directions, ordering, extra entries and payload accounting. It reads
+one decoded record at a time instead of retaining a decoded copy of the dataset.
 Run it in application tests or behind an admin command when checking integrity.
 `dstest.Open` runs it automatically when a test finishes.
 

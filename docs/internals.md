@@ -29,7 +29,15 @@ struct cannot mutate stored state or indexes. Indexes are rebuilt when records
 are loaded or replayed. During recovery, sorted indexes accumulate final terms
 by record key and sort once after WAL replay, avoiding repeated slice shifts.
 Normal updates keep unchanged index terms in place. Index extraction must be
-deterministic for a record.
+deterministic for a record and must not mutate its input or returned term slices.
+
+Commit preflight decodes each staged put into a collection-owned value once.
+Unique constraints, including other pending frames, use these prepared values;
+application reuses them after the WAL durability step. Callers cannot access the
+prepared values, and each frame drops its decoded references as operations apply.
+They are never serialized: WAL replay decodes stored JSON and performs migrations
+normally. This avoids validating and applying separately decoded copies. Pending
+byte limits still count encoded WAL bytes, not these transient decoded values.
 
 Transactions stage changes until commit. Collection reads through `In(tx, c)`
 can see staged writes; transaction-scoped index reads use committed indexes.
@@ -128,6 +136,10 @@ a pre-upgrade backup with its compatible binary when rollback is required.
 6. Deliver watch events after application. Commit statistics are reported on
    the committing goroutine through `OnCommit` when configured.
 
+Preflight also rejects JSON that cannot decode into the collection type, before
+appending anything, including collections with no unique index. This failure does
+not latch the database as failed; a later valid transaction can proceed.
+
 The state `RWMutex` protects records, indexes and applied sequence. The writer
 slot serializes transaction bodies and log appends; group-commit coordination
 allows later writers to append while an earlier writer waits for sync.
@@ -180,3 +192,11 @@ durable WAL bytes, torn writes, sync failures and concurrent commits. Process
 crash tests check acknowledged writes after killing a child process. Snapshot
 checksums, fallback, migrations and restored backups have separate tests.
 Neither suite replaces restore verification for an actual deployment.
+
+`Verify` decodes records one at a time and recomputes expected index terms. It
+checks every expected forward link and each record's reverse terms. Counting
+distinct expected links then detects extra multi-index links without retaining
+a rebuilt index or scanning each tag list repeatedly. It also checks unique
+owners, sorted-entry counts and strict ordering, dangling reverse keys, and cached
+payload accounting. Scratch term storage is reused and bounded by the largest
+individual term list, rather than retaining all decoded records.

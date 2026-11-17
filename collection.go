@@ -18,8 +18,9 @@ type Entity interface {
 type anyCollection interface {
 	collName() string
 	applyPut(key string, raw json.RawMessage) error
+	applyPrepared(key string, raw json.RawMessage, decoded any)
 	applyDelete(key string)
-	checkUnique(ops map[string]pendingOp) error
+	prepare(ops map[string]pendingOp, dst []walOp) ([]walOp, error)
 	beginRestore(records int)
 	endRestore()
 	dump() map[string]json.RawMessage
@@ -185,6 +186,15 @@ func (c *Collection[T]) applyPut(key string, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	c.applyDecoded(key, raw, v)
+	return nil
+}
+
+func (c *Collection[T]) applyPrepared(key string, raw json.RawMessage, decoded any) {
+	c.applyDecoded(key, raw, decoded.(T))
+}
+
+func (c *Collection[T]) applyDecoded(key string, raw json.RawMessage, v T) {
 	// Indexes replace changed terms and leave unchanged entries in place.
 	old, exists := c.data[key]
 	if !exists {
@@ -201,7 +211,6 @@ func (c *Collection[T]) applyPut(key string, raw json.RawMessage) error {
 	for _, i := range c.sorted {
 		i.add(key, v)
 	}
-	return nil
 }
 
 func (c *Collection[T]) applyDelete(key string) {
@@ -273,15 +282,17 @@ func (c *Collection[T]) bytes() int {
 // verify recomputes what this collection should look like and reports every
 // disagreement it finds, in the form of human-readable problems.
 //
-// It exists because the indexes are derived state maintained incrementally: if
-// a bug ever let them drift from the records, nothing else would notice. Here
-// the records are the source of truth and the indexes are rebuilt from scratch
-// and compared.
+// Records are decoded one at a time. Expected links are checked against both
+// index directions; link counts and sorted ordering rule out extra entries.
+// No decoded dataset or replacement indexes are retained.
 func (c *Collection[T]) verify() []string {
 	var problems []string
+	multiLinks := make([]int, len(c.multi))
+	seenTerms := make(map[string]struct{})
 
-	fresh := make(map[string]T, len(c.data))
+	var encodedBytes int
 	for key, raw := range c.data {
+		encodedBytes += len(key) + len(raw)
 		v, err := c.decode(raw)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s/%s: undecodable: %v", c.name, key, err))
@@ -291,17 +302,30 @@ func (c *Collection[T]) verify() []string {
 			problems = append(problems, fmt.Sprintf(
 				"%s/%s: record reports key %q; it is stored under a key it does not own", c.name, key, got))
 		}
-		fresh[key] = v
+		for j, i := range c.multi {
+			links, issues := i.verifyRecord(key, v, seenTerms)
+			multiLinks[j] += links
+			problems = append(problems, issues...)
+		}
+		for _, i := range c.unique {
+			problems = append(problems, i.verifyRecord(key, v)...)
+		}
+		for _, i := range c.sorted {
+			problems = append(problems, i.verifyRecord(key, v)...)
+		}
+	}
+	if encodedBytes != c.encodedBytes {
+		problems = append(problems, fmt.Sprintf("%s: payload accounting holds %d bytes, records imply %d", c.name, c.encodedBytes, encodedBytes))
 	}
 
-	for _, i := range c.multi {
-		problems = append(problems, i.verify(fresh)...)
+	for j, i := range c.multi {
+		problems = append(problems, i.verify(multiLinks[j])...)
 	}
 	for _, i := range c.unique {
-		problems = append(problems, i.verify(fresh)...)
+		problems = append(problems, i.verify()...)
 	}
 	for _, i := range c.sorted {
-		problems = append(problems, i.verify(fresh)...)
+		problems = append(problems, i.verify()...)
 	}
 	return problems
 }
@@ -311,49 +335,47 @@ func (c *Collection[T]) dump() map[string]json.RawMessage {
 	return c.data
 }
 
-// checkUnique validates a pending change set against every unique index.
-//
-// It runs at commit, before anything is written, so a transaction may swap a
-// unique value between two records — delete-then-insert, or a straight
-// exchange — which per-Put validation would reject. The caller holds the state
-// read lock so committed indexes and the pending window form one consistent view.
-func (c *Collection[T]) checkUnique(ops map[string]pendingOp) error {
-	if len(c.unique) == 0 {
-		return nil
-	}
-
-	decoded := make(map[string]T, len(ops))
-	for key, op := range ops {
+// prepare owns the decoded records until the frame applies. They are never
+// returned to the caller; checking and applying use the same decoded values.
+func (c *Collection[T]) prepare(ops map[string]pendingOp, dst []walOp) ([]walOp, error) {
+	start := len(dst)
+	puts := 0
+	for _, key := range sortedKeys(ops) {
+		op := ops[key]
 		if op.del {
+			dst = append(dst, walOp{Coll: c.name, Key: key, Op: opDelete})
 			continue
 		}
 		v, err := c.decode(op.raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		decoded[key] = v
+		dst = append(dst, walOp{Coll: c.name, Key: key, Op: opPut, Val: op.raw, decoded: v})
+		puts++
 	}
-	if len(decoded) == 0 {
-		return nil
+	if puts == 0 || len(c.unique) == 0 {
+		return dst, nil
 	}
+	err := c.checkUnique(ops, dst[start:], puts)
+	if err != nil {
+		return nil, err
+	}
+	return dst, nil
+}
+
+// The state read lock keeps indexes and the pending window consistent. Checks
+// cover the final change set so a transaction may exchange unique terms.
+func (c *Collection[T]) checkUnique(ops map[string]pendingOp, prepared []walOp, puts int) error {
 	pendPuts, pendDels := c.db.pendingOpsFor(c.name)
-	inflight := make(map[string]T, len(pendPuts))
-	for key, raw := range pendPuts {
-		v, err := c.decode(raw)
-		if err != nil {
-			return err
-		}
-		inflight[key] = v
-	}
 
 	for _, idx := range c.unique {
 		// holderOf answers "who holds this term, once the window is applied".
 		// A record in flight wins over the committed index, because it is
 		// already in the log; a record the window deletes, or moves to another
 		// term, releases what it held.
-		byTermInflight := make(map[string]string, len(inflight))
-		for _, key := range sortedKeys(inflight) {
-			if term := idx.term(inflight[key]); term != "" {
+		byTermInflight := make(map[string]string, len(pendPuts))
+		for _, key := range sortedKeys(pendPuts) {
+			if term := idx.term(pendPuts[key].(T)); term != "" {
 				byTermInflight[term] = key
 			}
 		}
@@ -368,15 +390,19 @@ func (c *Collection[T]) checkUnique(ops map[string]pendingOp) error {
 			if _, gone := pendDels[holder]; gone {
 				return "", false
 			}
-			if v, moved := inflight[holder]; moved && idx.term(v) != term {
+			if v, moved := pendPuts[holder]; moved && idx.term(v.(T)) != term {
 				return "", false
 			}
 			return holder, true
 		}
 
-		pending := make(map[string]string, len(decoded))
-		for _, key := range sortedKeys(decoded) {
-			term := idx.term(decoded[key])
+		pending := make(map[string]string, puts)
+		for _, op := range prepared {
+			if op.Op == opDelete {
+				continue
+			}
+			key := op.Key
+			term := idx.term(op.decoded.(T))
 			if term == "" {
 				continue // an empty term opts the record out of the index
 			}

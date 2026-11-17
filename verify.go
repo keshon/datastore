@@ -18,9 +18,9 @@ func (e *IntegrityError) Error() string {
 		len(e.Problems), strings.Join(e.Problems, "\n  "))
 }
 
-// Verify rebuilds every index from the records and reports where the live
-// structures disagree, along with any record that cannot be decoded or is
-// stored under a key it does not claim.
+// Verify recomputes index terms from records and checks both index directions,
+// including extra entries, sort order and payload accounting. It also reports
+// records that cannot be decoded or are stored under a key they do not claim.
 //
 // The indexes are derived state, maintained incrementally on every write. That
 // is fast and it is the one place where a bug could go unnoticed indefinitely:
@@ -29,8 +29,8 @@ func (e *IntegrityError) Error() string {
 // an admin command — rather than living only inside this package's own suite.
 //
 // It is read-only and takes the read lock for the duration, so it is safe to
-// call on a live database; on a large one it is O(records) and will briefly
-// block writers.
+// call on a live database. Work scales with record bytes and index entries;
+// writers wait for the whole check, while other readers can proceed.
 func (db *DB) Verify() error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
